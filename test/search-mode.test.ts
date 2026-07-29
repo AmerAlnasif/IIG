@@ -422,7 +422,9 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // not survive a `reindex-search-vector` switch.
     // #3515: bumped 15→16 to fold the effective detail level (det=) — a
     // detail=low write must not be served to a detail=medium lookup.
-    expect(KNOBS_HASH_VERSION).toBe(16);
+    // Bumped 16→18: qi= (qwen3 query-side Instruct template) joins the key
+    // (17 is claimed by the in-flight #3617 kof= knob).
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -601,8 +603,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 16 (15→16 detail fold #3515)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(16);
+  test('KNOBS_HASH_VERSION is 18 (15→16 detail fold #3515; 16→18 qwen3 query-side instruct)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

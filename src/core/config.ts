@@ -1046,6 +1046,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.dream.synthesize',
   'models.dream.extract_atoms',
   'cycle.extract_atoms.budget_usd',
+  'cycle.extract_atoms.max_source_chars',
+  'cycle.extract_atoms.page_discovery_budget',
   'models.dream.patterns',
   'models.dream.synthesize_verdict',
   'models.drift',

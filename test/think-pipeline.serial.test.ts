@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName } from '../src/core/operations.ts';
-import { runThink, persistSynthesis, type ThinkLLMClient } from '../src/core/think/index.ts';
+import { runThink, persistSynthesis, persistThinkTake, THINK_TAKE_CLAIM_MAX_CHARS, type ThinkLLMClient } from '../src/core/think/index.ts';
 import { sanitizeTakeForPrompt, renderTakesBlock } from '../src/core/think/sanitize.ts';
 import { resolveCitations, parseInlineCitations, normalizeStructuredCitations } from '../src/core/think/cite-render.ts';
 import { runGather } from '../src/core/think/gather.ts';
@@ -468,5 +468,120 @@ describe('think MCP op — #1698 C3 + #10', () => {
     const res: any = await withoutAnthropicKey(() => op.handler(baseCtx(false) as any, { question: 'op empty save test', save: true }));
     expect(res.saved_slug).toBeNull();
     expect(res.warnings).toContain('SYNTHESIS_EMPTY_NOT_PERSISTED');
+  });
+});
+
+describe('persistThinkTake — #2556 think --take actually persists', () => {
+  function synthResult(answer: string, ok = true): any {
+    return {
+      question: 'what should this page remember?',
+      answer, citations: [], gaps: [], pagesGathered: 0, takesGathered: 0,
+      graphHits: 0, modelUsed: 'stub', rounds: 1, warnings: [], synthesisOk: ok,
+      diagnostics: { pagesFromHybrid: 0, takesFromKeyword: 0, takesFromVector: 0, graphHits: 0 },
+    };
+  }
+
+  test('appends the synthesis answer as the next anchor take row', async () => {
+    const target = await engine.putPage('notes/think-take-target-example', {
+      title: 'Think take target', type: 'note',
+      compiled_truth: 'A safe placeholder page for think take persistence.',
+    });
+    const persisted = await persistThinkTake(
+      engine, synthResult('This page should remember the synthesized placeholder insight.'),
+      { anchor: 'notes/think-take-target-example' },
+    );
+    // Wave-4 dual-plane contract: this hermetic engine has no brain repo
+    // (sync.repo_path unset), so appendTake falls back to DB-only allocation
+    // and surfaces TAKE_FILE_PLANE_UNAVAILABLE. The row still lands.
+    expect(persisted).toMatchObject({ rowNum: 1, inserted: 1 });
+    expect(persisted.warnings).toEqual(['TAKE_FILE_PLANE_UNAVAILABLE']);
+    const takes = await engine.listTakes({ page_id: target.id });
+    expect(takes).toHaveLength(1);
+    expect(takes[0]).toMatchObject({
+      row_num: 1,
+      claim: 'This page should remember the synthesized placeholder insight.',
+      kind: 'take', holder: 'brain', source: 'gbrain think',
+    });
+    // Second take lands on the NEXT row (MAX+1 under the page lock).
+    const second = await persistThinkTake(
+      engine, synthResult('A second synthesized insight.'),
+      { anchor: 'notes/think-take-target-example' },
+    );
+    expect(second.rowNum).toBe(2);
+  });
+
+  test('bounds the claim: 2500-char multi-line answer → single-line 2000-char claim + TAKE_CLAIM_TRUNCATED', async () => {
+    const target = await engine.putPage('notes/think-take-truncate-example', {
+      title: 'Think take truncate target', type: 'note',
+      compiled_truth: 'A safe placeholder page for claim-bound persistence.',
+    });
+    // Multi-line answer well past the cap: fence cells are single-line, and
+    // sanitizeTakeForPrompt only ever reads the first 500 chars anyway.
+    const line = 'a'.repeat(99);
+    const answer = Array.from({ length: 25 }, () => line).join('\n'); // 25*99 + 24 = 2499 chars
+    expect(answer.length).toBeGreaterThan(THINK_TAKE_CLAIM_MAX_CHARS);
+
+    const persisted = await persistThinkTake(engine, synthResult(answer), {
+      anchor: 'notes/think-take-truncate-example',
+    });
+    expect(persisted.rowNum).toBe(1);
+    expect(persisted.inserted).toBe(1);
+    expect(persisted.warnings).toContain('TAKE_CLAIM_TRUNCATED');
+
+    const takes = await engine.listTakes({ page_id: target.id });
+    expect(takes).toHaveLength(1);
+    expect(takes[0].claim.length).toBe(THINK_TAKE_CLAIM_MAX_CHARS);
+    expect(takes[0].claim).not.toContain('\n'); // flattened before bounding
+  });
+
+  test('refuses empty/no-LLM synthesis instead of writing a blank take', async () => {
+    const target = await engine.putPage('notes/think-take-empty-example', {
+      title: 'Think take empty target', type: 'note',
+      compiled_truth: 'A safe placeholder page for empty think take persistence.',
+    });
+    const persisted = await persistThinkTake(
+      engine, synthResult('(no LLM available)', false),
+      { anchor: 'notes/think-take-empty-example' },
+    );
+    expect(persisted).toEqual({ rowNum: null, inserted: 0, warnings: ['TAKE_EMPTY_NOT_PERSISTED'] });
+    expect(await engine.listTakes({ page_id: target.id })).toHaveLength(0);
+  });
+
+  test('missing anchor and out-of-scope anchor fail with distinct loud signals', async () => {
+    expect(await persistThinkTake(engine, synthResult('x'), {})).toEqual(
+      { rowNum: null, inserted: 0, warnings: ['TAKE_REQUIRES_ANCHOR'] });
+    const missing = await persistThinkTake(engine, synthResult('x'), { anchor: 'notes/no-such-page' });
+    expect(missing.rowNum).toBeNull();
+    expect(missing.warnings[0]).toContain('TAKE_ANCHOR_NOT_FOUND');
+    // Scope confinement: the anchor exists in the default source but the
+    // caller's federated grant excludes it -> not found (fail-closed).
+    const scoped = await persistThinkTake(engine, synthResult('x'), {
+      anchor: 'notes/think-take-target-example', sourceIds: ['some-other-source'],
+    });
+    expect(scoped.rowNum).toBeNull();
+    expect(scoped.warnings[0]).toContain('TAKE_ANCHOR_NOT_FOUND');
+  });
+
+  test('op handler: local take persists; remote take stays blocked (#2556 + trust gate)', async () => {
+    const op = operationsByName['think'];
+    await engine.putPage('notes/think-take-op-example', {
+      title: 'Think take op target', type: 'note',
+      compiled_truth: 'Safe placeholder for the op-layer take test.',
+    });
+    const baseCtx = (remote: boolean) => ({
+      engine, config: {} as any, dryRun: false, remote,
+      logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+    });
+    // Remote: take must be zeroed by the trust gate; nothing written.
+    const remoteRes: any = await withoutAnthropicKey(() =>
+      op.handler(baseCtx(true) as any, { question: 'q', anchor: 'notes/think-take-op-example', take: true }));
+    expect(remoteRes.take_row).toBeNull();
+    expect(remoteRes.remote_persisted_blocked).toBe(true);
+    // Local with no LLM: synthesis empty -> take refused with the loud warning
+    // (proves the local path CONSUMES the flag instead of ignoring it).
+    const localRes: any = await withoutAnthropicKey(() =>
+      op.handler(baseCtx(false) as any, { question: 'q', anchor: 'notes/think-take-op-example', take: true }));
+    expect(localRes.take_row).toBeNull();
+    expect(localRes.warnings).toContain('TAKE_EMPTY_NOT_PERSISTED');
   });
 });

@@ -43,6 +43,15 @@ export interface RunImportResult {
   errors: number;
   chunksCreated: number;
   failures: Array<{ path: string; error: string }>;
+  /**
+   * #2114 anchor decision (red-team: was stderr-only, invisible to --json
+   * consumers). 'seeded' = sync.repo_path was unset and now points here;
+   * 'repointed' = --set-repo-path moved an existing anchor here; 'kept' =
+   * the existing anchor won (already here, or a different tree without the
+   * flag). Absent when no decision was made (non-git dir, managedBookmark,
+   * or import failures blocked the bookmark block).
+   */
+  anchor?: 'kept' | 'seeded' | 'repointed';
 }
 
 export async function runImport(
@@ -202,7 +211,7 @@ export async function runImport(
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--set-repo-path] [--json]');
     process.exit(1);
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -490,13 +499,9 @@ export async function runImport(
   }
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  if (jsonOutput) {
-    console.log(JSON.stringify({
-      status: 'success', duration_s: parseFloat(totalTime),
-      imported, skipped, errors, chunks: chunksCreated,
-      total_files: allFiles.length,
-    }));
-  } else {
+  // The --json summary is printed AFTER the anchor-decision block below so it
+  // can carry the `anchor` field (red-team: the decision was stderr-only).
+  if (!jsonOutput) {
     console.log(`\nImport complete (${totalTime}s):`);
     console.log(`  ${imported} pages imported`);
     console.log(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
@@ -560,6 +565,7 @@ export async function runImport(
   // ledger + bookmark via the shared gate (applySyncFailureGate). Skipping the
   // internal handling here prevents double-recording (which would double-count
   // the auto-skip `attempts` streak) and a competing bookmark write.
+  let anchorDecision: 'kept' | 'seeded' | 'repointed' | undefined;
   if (gitHead && !opts.managedBookmark) {
     // Record failures into the central JSONL so doctor can surface them.
     // Use gitHead as the commit so a later sync can tell "same broken
@@ -578,10 +584,50 @@ export async function runImport(
       );
     }
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await engine.setConfig('sync.repo_path', dir);
+    // repo-path.ts invariant: never persist a relative repo path. `dir` is
+    // already absolute here (resolveImportTargetDir at arg ingress, #1728) —
+    // this write is how `gbrain import .` used to seed the anchor that a
+    // later bare `gbrain sync` from the wrong cwd resolved into a foreign
+    // tree.
+    //
+    // #2114: set-if-unset. Silently OVERWRITING an existing, different
+    // anchor repointed every later bare `gbrain sync` at whatever tree the
+    // last import happened to touch. Repointing now requires the explicit
+    // --set-repo-path flag; without it the existing anchor wins and we say
+    // so on stderr.
+    const existingAnchor = await engine.getConfig('sync.repo_path');
+    if (!existingAnchor) {
+      await engine.setConfig('sync.repo_path', dir);
+      anchorDecision = 'seeded';
+    } else if (existingAnchor === dir) {
+      await engine.setConfig('sync.repo_path', dir);
+      anchorDecision = 'kept';
+    } else if (args.includes('--set-repo-path')) {
+      console.error(`sync.repo_path repointed: ${existingAnchor} -> ${dir} (--set-repo-path)`);
+      await engine.setConfig('sync.repo_path', dir);
+      anchorDecision = 'repointed';
+    } else {
+      console.error(
+        `sync.repo_path stays at ${existingAnchor} (this import ran in ${dir}). ` +
+        `Pass --set-repo-path to repoint the sync anchor to this directory.`,
+      );
+      anchorDecision = 'kept';
+    }
   }
 
-  return { imported, skipped, errors, chunksCreated, failures };
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      status: 'success', duration_s: parseFloat(totalTime),
+      imported, skipped, errors, chunks: chunksCreated,
+      total_files: allFiles.length,
+      ...(anchorDecision ? { anchor: anchorDecision } : {}),
+    }));
+  }
+
+  return {
+    imported, skipped, errors, chunksCreated, failures,
+    ...(anchorDecision ? { anchor: anchorDecision } : {}),
+  };
 }
 
 /**

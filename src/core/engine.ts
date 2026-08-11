@@ -552,6 +552,17 @@ export interface FactListOpts {
    * are returned. Remote (untrusted) callers must supply ['world'].
    */
   visibility?: FactVisibility[];
+  /**
+   * When true, `listFactsSince`'s `since` comparison and ORDER BY use
+   * COALESCE(valid_from, created_at) — event time — instead of creation
+   * time. Batch backfill (e.g. `extract-conversation-facts` run over many
+   * pages at once) inserts many facts with the same `created_at` (the
+   * batch's run time), which makes creation-time ordering useless for
+   * "what happened yesterday" recall — results sort by extraction order,
+   * not by when the underlying event occurred. Off by default: the facts
+   * meta-hook dedup path intentionally keeps creation-time semantics.
+   */
+  eventTime?: boolean;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */

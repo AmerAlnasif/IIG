@@ -4980,6 +4980,7 @@ const recall: Operation = {
       const since = parseSinceParam(p.since);
       if (since) {
         rows = await ctx.engine.listFactsSince(sourceId, since, {
+          eventTime: true,
           activeOnly: !includeExpired,
           limit,
           visibility,
@@ -4988,6 +4989,7 @@ const recall: Operation = {
     } else {
       // No filter: return recent across the source.
       rows = await ctx.engine.listFactsSince(sourceId, new Date(0), {
+        eventTime: true,
         activeOnly: !includeExpired,
         limit,
         visibility,

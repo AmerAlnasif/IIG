@@ -4872,9 +4872,13 @@ export class PGLiteEngine implements BrainEngine {
     entitySlug: string,
     opts?: FactListOpts,
   ): Promise<FactRow[]> {
+    const where: string[] = [`entity_slug = $entitySlug`];
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')`);
+    }
     return this._listFacts(source_id, {
       ...opts,
-      whereClauses: [`entity_slug = $entitySlug`],
+      whereClauses: where,
       whereParams: { entitySlug },
       order: 'valid_from DESC, id DESC',
     });
@@ -4891,6 +4895,9 @@ export class PGLiteEngine implements BrainEngine {
       where.push(`entity_slug = $entitySlug`);
       params.entitySlug = opts.entitySlug;
     }
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')`);
+    }
     return this._listFacts(source_id, {
       ...opts,
       whereClauses: where,
@@ -4904,9 +4911,13 @@ export class PGLiteEngine implements BrainEngine {
     sessionId: string,
     opts?: FactListOpts,
   ): Promise<FactRow[]> {
+    const where: string[] = [`source_session = $sessionId`];
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')`);
+    }
     return this._listFacts(source_id, {
       ...opts,
-      whereClauses: [`source_session = $sessionId`],
+      whereClauses: where,
       whereParams: { sessionId },
       order: 'created_at DESC, id DESC',
     });

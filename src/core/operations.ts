@@ -4969,12 +4969,14 @@ const recall: Operation = {
         activeOnly: !includeExpired,
         limit,
         visibility,
+        excludeAuditRows: true,
       });
     } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
       rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, {
         activeOnly: !includeExpired,
         limit,
         visibility,
+        excludeAuditRows: true,
       });
     } else if (p.since !== undefined) {
       const since = parseSinceParam(p.since);
@@ -4983,6 +4985,7 @@ const recall: Operation = {
           activeOnly: !includeExpired,
           limit,
           visibility,
+          excludeAuditRows: true,
         });
       }
     } else {
@@ -4991,8 +4994,18 @@ const recall: Operation = {
         activeOnly: !includeExpired,
         limit,
         visibility,
+        excludeAuditRows: true,
       });
     }
+
+    // extract-conversation-facts writes durable audit checkpoint rows
+    // (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE) into the facts table.
+    // They are checkpoints, not user facts. Every arm above already passes
+    // excludeAuditRows: true (SQL-level, both engines) — this client-side
+    // filter is belt-and-braces defense in depth, not the primary guard.
+    rows = rows.filter(
+      (r) => r.fact !== 'EXTRACTION_COMPLETE' && r.fact !== 'EXTRACTION_NOT_APPLICABLE',
+    );
 
     if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 

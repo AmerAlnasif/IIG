@@ -559,8 +559,10 @@ export interface FactListOpts {
    * pages at once) inserts many facts with the same `created_at` (the
    * batch's run time), which makes creation-time ordering useless for
    * "what happened yesterday" recall — results sort by extraction order,
-   * not by when the underlying event occurred. Off by default: the facts
-   * meta-hook dedup path intentionally keeps creation-time semantics.
+   * not by when the underlying event occurred. Off by default, so the
+   * facts meta-hook's hot-memory injection cache (`facts/meta-hook.ts`,
+   * a 24h recency window re-ranked by decayed confidence) keeps its
+   * creation-time semantics unchanged.
    */
   eventTime?: boolean;
 }

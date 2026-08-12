@@ -48,6 +48,7 @@ import { withBudgetTracker } from '../ai/gateway.ts';
 import { listSources } from '../sources-ops.ts';
 import {
   runExtractConversationFactsCore,
+  isAbortError,
   ALLOWED_TYPES,
   type AllowedType,
   type ExtractConversationFactsResult,
@@ -246,6 +247,7 @@ export async function runPhaseConversationFactsBackfill(
             break;
           }
         } catch (err) {
+          if (isAbortError(err) || opts.signal?.aborted) throw err;
           if (err instanceof BudgetExhausted) {
             skippedByBrainWideCap = Math.max(
               0,
@@ -272,17 +274,20 @@ export async function runPhaseConversationFactsBackfill(
             segments_processed: 0,
             facts_extracted: 0,
             facts_inserted: 0,
+            fallback_slugify_count: 0,
+            resolution_errors: 0,
             error: (err as Error).message,
           };
         }
       }
     });
   } catch (err) {
-    if (err instanceof BudgetExhausted) {
-      // Brain-wide cap hit during last source.
-    } else if ((err as Error).message === 'aborted' || opts.signal?.aborted) {
-      // Propagate abort.
+    if (isAbortError(err) || opts.signal?.aborted) {
+      // Abort is control flow owned by the cycle runner; never downgrade it
+      // into a per-source warning or phase failure result.
       throw err;
+    } else if (err instanceof BudgetExhausted) {
+      // Brain-wide cap hit during last source.
     } else {
       // Unexpected error.
       return {
@@ -306,6 +311,8 @@ export async function runPhaseConversationFactsBackfill(
     pages_marked_non_extractable: 0,
     pages_failed: 0,
     facts_inserted: 0,
+    fallback_slugify_count: 0,
+    resolution_errors: 0,
     sources_processed: 0,
   };
   for (const r of Object.values(perSourceResults)) {
@@ -317,6 +324,8 @@ export async function runPhaseConversationFactsBackfill(
     totals.pages_marked_non_extractable += r.pages_marked_non_extractable;
     totals.pages_failed += r.pages_failed;
     totals.facts_inserted += r.facts_inserted;
+    totals.fallback_slugify_count += r.fallback_slugify_count;
+    totals.resolution_errors += r.resolution_errors;
   }
 
   const anyError = Object.values(perSourceResults).some(
@@ -340,6 +349,8 @@ export async function runPhaseConversationFactsBackfill(
       pages_marked_non_extractable: totals.pages_marked_non_extractable,
       pages_failed: totals.pages_failed,
       facts_inserted: totals.facts_inserted,
+      fallback_slugify_count: totals.fallback_slugify_count,
+      resolution_errors: totals.resolution_errors,
       spent_usd: totalSpent,
       skipped_by_brain_wide_cap: skippedByBrainWideCap,
       skipped_by_brain_wide_walltime: skippedByBrainWideWalltime,

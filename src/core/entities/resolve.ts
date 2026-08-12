@@ -22,16 +22,19 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { normalizeAlias } from '../search/alias-normalize.ts';
+import { isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
  *
  * Resolution order:
- *   1. If `raw` is already a page slug shape (contains a "/" or matches an
- *      exact pages.slug row in this source), return it untouched.
- *   2. Resolve a bare name only when prefix expansion finds one candidate.
- *   3. For multi-token input, require a high-specificity fuzzy match against
- *      pages.slug + pages.title within the source (case-insensitive).
+ *   1. For slug-shaped input, prefer an exact live page, then a source-scoped
+ *      old-slug redirect from `slug_aliases`.
+ *   2. Try an exact normalized, source-scoped `page_aliases` match. Ambiguous
+ *      aliases are recorded and fall through without guessing.
+ *   3. Preserve the hardened resolver cascade: bare names expand only when
+ *      globally unambiguous; multi-token input requires a 0.7 fuzzy match.
  *   4. Fall back to a deterministic slugify: lowercase-no-spaces with
  *      hyphen-collapse. NOT prefixed with a directory — caller decides
  *      whether to prefix `people/`, `companies/`, etc.
@@ -44,37 +47,8 @@ export async function resolveEntitySlug(
   source_id: string,
   raw: string,
 ): Promise<string | null> {
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  // 1. Exact match on slug. If raw already looks like a slug (or matches
-  //    a row exactly), use it.
-  if (looksLikeSlug(trimmed)) {
-    const exact = await tryExactSlug(engine, source_id, trimmed);
-    if (exact) return exact;
-  }
-
-  // 2. Prefix-expansion match: when the input looks like a bare first name
-  //    (no slash, no prefix, slugifies to a single short token), try
-  //    `people/<token>-%` then `companies/<token>-%`. Short bare names
-  //    score terribly on pg_trgm — similarity('alice', 'alice-example')
-  //    is below the fuzzy threshold — so this is the layer that catches
-  //    `"Alice"` → `people/alice-example` before we phantom-stub a bare
-  //    `people/alice.md`.
-  if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
-    if (expanded) return expanded;
-  } else {
-    // 3. Fuzzy match against existing pages within the source. Bare names
-    //    deliberately skip this arm: a shared first name is not specific
-    //    enough to choose one person by trigram score or popularity.
-    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
-    if (fuzzy) return fuzzy;
-  }
-
-  // 4. Fallback: deterministic slugify.
-  return fallbackSlugify(trimmed);
+  const resolved = await resolveEntitySlugWithSource(engine, source_id, raw);
+  return resolved?.slug ?? null;
 }
 
 /**
@@ -116,21 +90,27 @@ const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
 /**
  * v0.40.2.0 — resolution-source-tagged variant for trajectory routing.
  *
- * Same resolution chain as `resolveEntitySlug` but returns the source
- * (`exact_page` | `fuzzy_match` | `fallback_slugify`) alongside the slug
- * so trajectory callers can gate on `resolution_source !==
- * 'fallback_slugify'` — querying findTrajectory on an invented slug
- * always returns [] and wastes a SQL round-trip. Codex Problem 5 from
- * v0.40.2.0 outside-voice review.
+ * Same resolution chain as `resolveEntitySlug` but returns the source tag
+ * alongside the slug so trajectory callers can distinguish existing pages,
+ * alias hits, and invented fallback slugs. Querying findTrajectory on an
+ * invented slug always returns [] and wastes a SQL round-trip. Codex Problem
+ * 5 from v0.40.2.0 outside-voice review.
  *
  * The original `resolveEntitySlug` keeps its existing contract (returns
  * just the slug) for all pre-v0.40 call sites — no caller-side churn.
  */
-export type ResolutionSource = 'exact_page' | 'fuzzy_match' | 'fallback_slugify';
+export type ResolutionSource =
+  | 'exact_page'
+  | 'alias_redirect'
+  | 'alias_match'
+  | 'fuzzy_match'
+  | 'fallback_slugify';
 
 export interface ResolveResult {
   slug: string;
   source: ResolutionSource;
+  /** Present only when a colliding page alias fell through to the old cascade. */
+  ambiguous_aliases?: string[];
 }
 
 export async function resolveEntitySlugWithSource(
@@ -142,21 +122,100 @@ export async function resolveEntitySlugWithSource(
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
-  // Mirror resolveEntitySlug's resolution chain but tag each branch.
+  let ambiguousAliases: string[] | undefined;
+  let aliasPermissionDenied = false;
+
+  // Slug-shaped input: an active page remains authoritative. If the old slug
+  // page was retired, consult the source-scoped redirect table next.
   if (looksLikeSlug(trimmed)) {
     const exact = await tryExactSlug(engine, source_id, trimmed);
     if (exact) return { slug: exact, source: 'exact_page' };
+
+    try {
+      const redirected = await engine.resolveSlugWithAlias(trimmed, source_id);
+      if (redirected !== trimmed) {
+        return { slug: redirected, source: 'alias_redirect' };
+      }
+    } catch (error) {
+      if (!isPermissionDeniedError(error)) throw error;
+      warnAliasPermissionDenied('slug_aliases', error);
+      aliasPermissionDenied = true;
+    }
   }
 
+  // page_aliases permits collisions. A single distinct target is safe;
+  // multiple targets are surfaced as metadata and the hardened v0.45.7
+  // prefix/fuzzy/fallback cascade decides without guessing between aliases.
+  // If slug_aliases was permission-denied, skip this second alias probe so the
+  // surrounding transaction can resume the pre-alias cascade immediately.
+  if (!aliasPermissionDenied) {
+    const aliasNorm = normalizeAlias(trimmed);
+    if (aliasNorm) {
+      let aliasRows: Array<{ slug: string; source_id: string }> = [];
+      try {
+        const matches = await engine.resolveAliases([aliasNorm], { sourceId: source_id });
+        aliasRows = matches.get(aliasNorm) ?? [];
+      } catch (error) {
+        // Pre-v110 brains retain the old cascade. SQLSTATE 42501 also falls
+        // back when the connecting role cannot read the alias tables.
+        if (isUndefinedTableError(error)) {
+          // Keep the pre-v110 behavior unchanged.
+        } else if (isPermissionDeniedError(error)) {
+          warnAliasPermissionDenied('page_aliases', error);
+        } else {
+          throw error;
+        }
+      }
+
+      const targets = Array.from(new Set(aliasRows.map((row) => row.slug).filter(Boolean))).sort();
+      if (targets.length === 1) {
+        return { slug: targets[0], source: 'alias_match' };
+      }
+      if (targets.length > 1) ambiguousAliases = targets;
+    }
+  }
+
+  // Preserve the current safe cascade: bare names only expand when globally
+  // unambiguous, while multi-token input uses the current 0.7 fuzzy floor.
   if (isBareName(trimmed)) {
     const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
-    if (expanded) return { slug: expanded, source: 'fuzzy_match' };
+    if (expanded) return withAmbiguousAliases(expanded, 'fuzzy_match', ambiguousAliases);
   } else {
     const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
-    if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
+    if (fuzzy) return withAmbiguousAliases(fuzzy, 'fuzzy_match', ambiguousAliases);
   }
 
-  return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+  return withAmbiguousAliases(fallbackSlugify(trimmed), 'fallback_slugify', ambiguousAliases);
+}
+
+function isPermissionDeniedError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; sqlState?: unknown };
+  return String(candidate.code ?? candidate.sqlState ?? '') === '42501';
+}
+
+function warnAliasPermissionDenied(
+  table: 'slug_aliases' | 'page_aliases',
+  error: unknown,
+): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  warnOncePerProcess(
+    'resolveEntitySlug:alias_permission_denied',
+    `[entity-resolver] WARNING: alias lookup permission denied (SQLSTATE 42501 while reading ${table}: ${detail}). ` +
+      'Continuing with the pre-alias fuzzy/prefix/fallback cascade; canonical alias matches may be missed. ' +
+      'The connecting role needs SELECT (and any applicable row-security policy) on slug_aliases and page_aliases. ' +
+      'Further alias-permission warnings are suppressed for this process.',
+  );
+}
+
+function withAmbiguousAliases(
+  slug: string,
+  source: ResolutionSource,
+  ambiguousAliases: string[] | undefined,
+): ResolveResult {
+  return ambiguousAliases
+    ? { slug, source, ambiguous_aliases: ambiguousAliases }
+    : { slug, source };
 }
 
 /**

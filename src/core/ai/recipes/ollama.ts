@@ -14,9 +14,9 @@ export const ollama: Recipe = {
   touchpoints: {
     chat: {
       // Local Ollama chat models are user-managed; this list covers common
-      // local coding/chat models, and the gateway's extended-model
-      // registration path (registerConfigSelectedChatModel) permits explicit
-      // DB-selected models beyond it — custom local tags need no entry here.
+      // local coding/chat models for display/default-pickers only. The gateway
+      // has no runtime model allowlist, so explicit DB-selected custom local
+      // tags need no entry here.
       models: [
         'qwen3.6:35b-a3b-coding-mxfp8',
         'qwen3-coder:30b',

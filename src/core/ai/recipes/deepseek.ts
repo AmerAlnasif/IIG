@@ -95,7 +95,13 @@ export const deepseek: Recipe = {
       models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
       supports_tools: true,
       supports_subagent_loop: true,
-      supports_prompt_cache: false,
+      // DeepSeek's context caching is on by default for every account — the
+      // API reports prompt_cache_hit_tokens / prompt_cache_miss_tokens and
+      // there is no client opt-in to make. Declaring false contradicted this
+      // touchpoint's own cost_per_1m_input_usd, annotated as the *cache-miss*
+      // baseline — i.e. it already assumes a cache exists — and produced advice
+      // telling operators to move to a more expensive provider "for lower cost".
+      supports_prompt_cache: true,
       max_context_tokens: 1_000_000,
       cost_per_1m_input_usd: 0.14, // deepseek-v4-flash cache-miss baseline
       cost_per_1m_output_usd: 0.28,

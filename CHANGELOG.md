@@ -2,6 +2,35 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.45.9.1-asmitty.1] - 2026-08-12
+
+**Dream reasoning now uses the model assigned to each phase, and fact consolidation produces model-synthesized takes instead of copying one input fact.**
+
+Extracted facts now reach consolidation reliably: entity attribution resolves to one live page, similarity thresholds are configurable, histories larger than 100 facts are fully scanned, and blocked buckets explain why they were skipped. Consolidation resolves `models.consolidate`, synthesizes one grounded claim per eligible cluster through the provider-neutral gateway, enforces a bounded per-run model budget, and refreshes the cycle lock while it works.
+
+## To take advantage of v0.45.9.1-asmitty.1
+
+1. Upgrade with `gbrain upgrade`.
+2. Run `gbrain models` to verify the resolved routes for consolidation, atom/concept synthesis, take proposal/grading, calibration, and thin-page enrichment.
+3. Run `gbrain dream --phase consolidate --dry-run --json` and inspect page-resolution, similarity, embedding, model, and budget diagnostics before applying changes.
+
+### Changed
+
+- Consolidation uses `models.consolidate` and `cycle.consolidate.budget_usd`; synthesis failures or budget exhaustion leave source facts pending for retry instead of falling back to the old copy-best-fact shortcut.
+- `propose_takes`, `grade_takes`, `calibration_profile`, `synthesize_concepts`, `extract_atoms`, `enrich_thin`, and `schema-suggest` resolve their phase-specific `models.*` routes through the shared model resolver.
+- `schema-suggest` now performs the LLM refinement promised by its native CLI and source contract; provider failure is surfaced in phase notes before the review-only heuristic fallback is used.
+- `grade_takes` retrieves source-scoped evidence through native hybrid search, keeps pages updated after each take's date, and sends the top five distinct chunks to the configured judge model.
+- `gbrain models` reports every model-bearing dream phase, including compatibility aliases for the former atom-extraction and thin-enrichment keys.
+- GPT-4.1 family pricing is registered in the canonical pricing table so the configured `openai:gpt-4.1-mini` consolidation route remains budget-bounded.
+
+### Fixed
+
+- Conversation fact extraction canonicalizes display names and aliases to one live, source-scoped page before insert, rejects ambiguous or deleted targets, retries on lookup failures, and batches resolution into two indexed database reads.
+- Consolidation diagnostics distinguish scanned, page-resolved, missing-page, below-similarity, missing-embedding, synthesis-failed, and budget-blocked work.
+- Long consolidation runs now use the cycle's native database-lock keepalive instead of continuing after their lock expires.
+- Conversation fact backfill now enforces its documented per-source and brain-wide walltime limits with the native abort path; worker cancellation is propagated instead of being swallowed as a single-source warning.
+- `grade_takes` threads source scope into unresolved-take selection instead of grading every source in a source-scoped cycle.
+
 ## [0.45.9.0] - 2026-08-12
 
 **Your agent's memory keeps saving itself — even in a cloud sandbox, even on `/exit`, and it tells you the moment it can't.** The paste-in personal-agent install now works first-class in Claude Code's cloud environment, not just on a laptop. The persistence lane got three fixes that matter whether you're local or in the cloud: the workspace push now verifies repo privacy through a portable ladder that keeps working when the sandbox blocks the GitHub API, it runs after every turn (not only at session end, which the harness never fires on `/exit`), and a failed push surfaces on your next turn instead of failing in silence. Setup adapts to where it runs — no more scheduled-job errors on hosts without a scheduler, and no half-created repos in an environment that can't push them.

@@ -23,6 +23,7 @@ import {
   runPhaseGradeTakes,
   parseJudgeOutput,
   evidenceSignature,
+  retrieveNativeGradeEvidence,
   takeIsOldEnough,
   GRADE_TAKES_PROMPT_VERSION,
   type JudgeFn,
@@ -30,6 +31,8 @@ import {
 } from '../src/core/cycle/grade-takes.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { BrainEngine, Take, TakeResolution } from '../src/core/engine.ts';
+import type { SearchResult } from '../src/core/types.ts';
+import { BudgetMeter } from '../src/core/cycle/budget-meter.ts';
 
 // ─── Mock engine ────────────────────────────────────────────────────
 
@@ -46,14 +49,20 @@ interface CapturedResolve {
 function buildMockEngine(opts: {
   takes: Take[];
   cachedGrades?: Set<string>; // composite-key strings already in take_grade_cache
-}): { engine: BrainEngine; captured: CapturedSql[]; resolves: CapturedResolve[] } {
+  config?: Record<string, string>;
+}): { engine: BrainEngine; captured: CapturedSql[]; resolves: CapturedResolve[]; listOpts: unknown[] } {
   const captured: CapturedSql[] = [];
   const resolves: CapturedResolve[] = [];
+  const listOpts: unknown[] = [];
   const cached = opts.cachedGrades ?? new Set<string>();
 
   const engine = {
     kind: 'pglite',
-    async listTakes() {
+    async getConfig(key: string): Promise<string | null> {
+      return opts.config?.[key] ?? null;
+    },
+    async listTakes(listOptions?: unknown) {
+      listOpts.push(listOptions);
       return opts.takes;
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
@@ -71,7 +80,7 @@ function buildMockEngine(opts: {
     },
   } as unknown as BrainEngine;
 
-  return { engine, captured, resolves };
+  return { engine, captured, resolves, listOpts };
 }
 
 function buildTake(opts: Partial<Take> & { id: number; sinceDate: string | null }): Take {
@@ -199,7 +208,79 @@ describe('takeIsOldEnough', () => {
   });
 });
 
+describe('retrieveNativeGradeEvidence', () => {
+  test('uses source-scoped native search and keeps the top five distinct chunks newer than the take', async () => {
+    const take = buildTake({
+      id: 10,
+      sinceDate: '2024-01-01',
+      claim: 'Acme will reach ten million dollars in annual recurring revenue',
+    });
+    const hits = Array.from({ length: 7 }, (_, i) => ({
+      page_id: i + 1,
+      chunk_id: i + 100,
+      chunk_index: 0,
+      slug: `companies/acme-evidence-${i + 1}`,
+      title: `Acme evidence ${i + 1}`,
+      chunk_text: `Evidence chunk ${i + 1}`,
+      score: 1 - i / 10,
+    })) as SearchResult[];
+    // Duplicate the first chunk; it must not consume a top-five slot.
+    hits.splice(1, 0, { ...hits[0]! });
+    const engine = {
+      async executeRaw() {
+        return Array.from({ length: 6 }, (_, i) => ({
+          id: i + 1,
+          updated_at: `2025-01-0${i + 1}T00:00:00.000Z`,
+        }));
+      },
+    } as unknown as BrainEngine;
+    let capturedQuery = '';
+    let capturedScope: Record<string, unknown> = {};
+    const evidence = await retrieveNativeGradeEvidence(
+      engine,
+      take,
+      { sourceId: 'source-a' },
+      async (_engine, query, searchOpts) => {
+        capturedQuery = query;
+        capturedScope = searchOpts as unknown as Record<string, unknown>;
+        return hits;
+      },
+    );
+
+    expect(capturedQuery).toBe(take.claim.slice(0, 150));
+    expect(capturedScope.sourceId).toBe('source-a');
+    expect(capturedScope.expansion).toBe(false);
+    expect((evidence.match(/Evidence chunk/g) ?? [])).toHaveLength(5);
+    expect(evidence).toContain('companies/acme-evidence-1');
+    expect(evidence).not.toContain('companies/acme-evidence-7');
+  });
+
+  test('returns an honest no-evidence marker when all search hits predate the take', async () => {
+    const take = buildTake({ id: 11, sinceDate: '2025-01-01' });
+    const engine = {
+      async executeRaw() { return []; },
+    } as unknown as BrainEngine;
+    const evidence = await retrieveNativeGradeEvidence(
+      engine,
+      take,
+      {},
+      async () => [{
+        page_id: 1,
+        chunk_id: 1,
+        chunk_index: 0,
+        slug: 'notes/old',
+        title: 'Old',
+        chunk_text: 'old evidence',
+        score: 1,
+      } as SearchResult],
+    );
+    expect(evidence).toBe('(no evidence found after 2025-01-01)');
+  });
+});
+
 // ─── Phase integration ──────────────────────────────────────────────
+
+const mockEvidenceRetriever: EvidenceRetrieverFn = async () => 'mock evidence body';
 
 describe('runPhaseGradeTakes — phase integration', () => {
   test('happy path: judge produces verdict, lands in take_grade_cache (applied=false default)', async () => {
@@ -224,11 +305,19 @@ describe('runPhaseGradeTakes — phase integration', () => {
     expect(resolves).toHaveLength(0); // no canonical mutation
   });
 
+  test('threads the operation source scope into unresolved-take selection', async () => {
+    const { engine, listOpts } = buildMockEngine({ takes: [] });
+    const ctx = { ...buildCtx(engine), sourceId: 'source-a' };
+    await runPhaseGradeTakes(ctx, {});
+    expect(listOpts).toHaveLength(1);
+    expect(listOpts[0]).toMatchObject({ sourceId: 'source-a' });
+  });
+
   test('D17: auto-resolve OFF by default — even high-confidence verdict does NOT mutate takes', async () => {
     const takes = [buildTake({ id: 1, sinceDate: '2023-01-01' })];
     const { engine, resolves } = buildMockEngine({ takes });
     const judge: JudgeFn = async () => ({ verdict: 'correct', confidence: 1.0, reasoning: 'certain' });
-    const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
+    const result = await runPhaseGradeTakes(buildCtx(engine), { judge, evidenceRetriever: mockEvidenceRetriever });
     const details = result.details as Record<string, unknown>;
     expect(details.auto_resolve).toBe(false);
     expect(details.auto_applied).toBe(0);
@@ -241,6 +330,7 @@ describe('runPhaseGradeTakes — phase integration', () => {
     const judge: JudgeFn = async () => ({ verdict: 'incorrect', confidence: 0.96, reasoning: 'contradicted' });
     const result = await runPhaseGradeTakes(buildCtx(engine), {
       judge,
+      evidenceRetriever: mockEvidenceRetriever,
       autoResolve: true,
       autoResolveThreshold: 0.95,
     });
@@ -257,6 +347,7 @@ describe('runPhaseGradeTakes — phase integration', () => {
     const judge: JudgeFn = async () => ({ verdict: 'correct', confidence: 0.85, reasoning: 'leaning yes' });
     const result = await runPhaseGradeTakes(buildCtx(engine), {
       judge,
+      evidenceRetriever: mockEvidenceRetriever,
       autoResolve: true,
       autoResolveThreshold: 0.95,
     });
@@ -271,7 +362,12 @@ describe('runPhaseGradeTakes — phase integration', () => {
     const takes = [buildTake({ id: 1, sinceDate: '2023-01-01' })];
     const { engine, resolves } = buildMockEngine({ takes });
     const judge: JudgeFn = async () => ({ verdict: 'unresolvable', confidence: 1.0, reasoning: 'no evidence yet' });
-    await runPhaseGradeTakes(buildCtx(engine), { judge, autoResolve: true, autoResolveThreshold: 0.95 });
+    await runPhaseGradeTakes(buildCtx(engine), {
+      judge,
+      evidenceRetriever: mockEvidenceRetriever,
+      autoResolve: true,
+      autoResolveThreshold: 0.95,
+    });
     expect(resolves).toHaveLength(0);
   });
 
@@ -320,7 +416,7 @@ describe('runPhaseGradeTakes — phase integration', () => {
       if (calls === 1) throw new Error('judge timeout');
       return { verdict: 'correct', confidence: 0.9, reasoning: 'second succeeded' };
     };
-    const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
+    const result = await runPhaseGradeTakes(buildCtx(engine), { judge, evidenceRetriever: mockEvidenceRetriever });
     expect(result.status).toBe('ok');
     const details = result.details as Record<string, unknown>;
     expect(details.verdicts_written).toBe(1);
@@ -362,5 +458,57 @@ describe('judge model follows the gateway chat model (label = actual)', () => {
     } finally {
       resetGateway();
     }
+  });
+
+  test('models.grade_takes overrides the gateway and drives hint, cache key, and telemetry', async () => {
+    const { configureGateway, resetGateway } = await import('../src/core/ai/gateway.ts');
+    configureGateway({ chat_model: 'openai:gpt-5', env: { OPENAI_API_KEY: 'test-key' } });
+    try {
+      const takes = [buildTake({ id: 2, sinceDate: '2023-01-01' })];
+      const { engine, captured } = buildMockEngine({
+        takes,
+        config: { 'models.grade_takes': 'anthropic:claude-haiku-4-5' },
+      });
+      const hints: Array<string | undefined> = [];
+      const judge: JudgeFn = async ({ modelHint }) => {
+        hints.push(modelHint);
+        return { verdict: 'correct', confidence: 0.9, reasoning: 'held' };
+      };
+      const result = await runPhaseGradeTakes(buildCtx(engine), {
+        judge,
+        evidenceRetriever: async () => 'evidence body',
+      });
+
+      expect(hints).toEqual(['anthropic:claude-haiku-4-5']);
+      expect(result.details.model).toBe('anthropic:claude-haiku-4-5');
+      const insert = captured.find(c => c.sql.includes('INSERT INTO take_grade_cache'));
+      expect(insert!.params[2]).toBe('claude-haiku-4-5');
+    } finally {
+      resetGateway();
+    }
+  });
+
+  test('budgets a configured OpenAI judge with its provider-prefixed model id', async () => {
+    const takes = [buildTake({ id: 3, sinceDate: '2023-01-01' })];
+    const { engine } = buildMockEngine({
+      takes,
+      config: { 'models.grade_takes': 'openai:gpt-4.1-mini' },
+    });
+    let judgeCalls = 0;
+    const result = await runPhaseGradeTakes(buildCtx(engine), {
+      judge: async () => {
+        judgeCalls++;
+        return { verdict: 'correct', confidence: 0.9, reasoning: 'held' };
+      },
+      evidenceRetriever: async () => 'evidence body',
+      meter: new BudgetMeter({
+        budgetUsd: 0.000001,
+        phase: 'grade_takes',
+      }),
+    });
+
+    expect(result.status).toBe('warn');
+    expect(result.details.budget_exhausted).toBe(true);
+    expect(judgeCalls).toBe(0);
   });
 });

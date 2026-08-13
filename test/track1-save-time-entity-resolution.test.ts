@@ -22,6 +22,7 @@ type EngineKind = 'postgres' | 'pglite';
 
 class ResolverHarness {
   readonly exactPages = new Map<string, string>();
+  readonly softDeletedPages = new Set<string>();
   readonly slugAliases = new Map<string, string>();
   readonly pageAliases = new Map<string, string[]>();
   readonly fuzzy = new Map<string, string>();
@@ -47,6 +48,12 @@ class ResolverHarness {
 
   addExact(slug: string, sourceId = this.sourceId): void {
     this.exactPages.set(this.key(sourceId, slug), slug);
+    this.softDeletedPages.delete(this.key(sourceId, slug));
+  }
+
+  addSoftDeleted(slug: string, sourceId = this.sourceId): void {
+    this.exactPages.set(this.key(sourceId, slug), slug);
+    this.softDeletedPages.add(this.key(sourceId, slug));
   }
 
   addSlugAlias(alias: string, canonical: string, sourceId = this.sourceId): void {
@@ -66,10 +73,26 @@ class ResolverHarness {
   }
 
   async executeRaw<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+    if (sql.includes('slug = ANY($2::text[])')) {
+      if (!sql.includes('deleted_at IS NULL')) {
+        throw new Error('alias target validation must exclude soft-deleted pages');
+      }
+      const sourceId = String(params[0]);
+      const slugs = Array.isArray(params[1]) ? params[1].map(String) : [];
+      return slugs
+        .filter((slug) => {
+          const key = this.key(sourceId, slug);
+          return this.exactPages.has(key) && !this.softDeletedPages.has(key);
+        })
+        .map((slug) => ({ slug })) as T[];
+    }
     if (sql.includes('SELECT slug FROM pages WHERE source_id')) {
       const sourceId = String(params[0]);
       const slug = String(params[1]);
-      const exact = this.exactPages.get(this.key(sourceId, slug));
+      const key = this.key(sourceId, slug);
+      const exact = this.softDeletedPages.has(key)
+        ? undefined
+        : this.exactPages.get(key);
       return (exact ? [{ slug: exact }] : []) as T[];
     }
     if (sql.includes('GREATEST(') && sql.includes('similarity(')) {
@@ -140,6 +163,7 @@ for (const kind of ['postgres', 'pglite'] as const) {
       const harness = new ResolverHarness(kind);
       harness.addSlugAlias('people/brian-old', 'people/brian-example');
       harness.addSlugAlias('people/brian-old', 'people/wrong-source', 'source-b');
+      harness.addExact('people/brian-example');
 
       expect(await resolveEntitySlugWithSource(
         harness.asEngine(),
@@ -174,6 +198,7 @@ for (const kind of ['postgres', 'pglite'] as const) {
       const harness = new ResolverHarness(kind);
       harness.addPageAlias('brian', ['people/brian-example']);
       harness.addPageAlias('brian', ['people/wrong-source'], 'source-b');
+      harness.addExact('people/brian-example');
 
       expect(await resolveEntitySlugWithSource(
         harness.asEngine(),
@@ -190,6 +215,7 @@ for (const kind of ['postgres', 'pglite'] as const) {
       const harness = new ResolverHarness(kind);
       harness.addPageAlias('kendall', ['people/kendall-example']);
       harness.addPageAlias('kendall-example', ['people/kendall-example']);
+      harness.addExact('people/kendall-example');
 
       expect(await resolveEntitySlugWithSource(
         harness.asEngine(),
@@ -253,6 +279,8 @@ for (const kind of ['postgres', 'pglite'] as const) {
         'people/brian-alpha',
         'people/brian-beta',
       ]);
+      harness.addExact('people/brian-alpha');
+      harness.addExact('people/brian-beta');
       harness.addFuzzy('Brian Example', 'people/brian-fuzzy');
 
       expect(await resolveEntitySlugWithSource(
@@ -264,6 +292,64 @@ for (const kind of ['postgres', 'pglite'] as const) {
         source: 'fuzzy_match',
         ambiguous_aliases: ['people/brian-alpha', 'people/brian-beta'],
       });
+    });
+
+    test('dead alias targets fall through even when another source has a live page', async () => {
+      const cases = [
+        {
+          raw: 'alice-old-soft',
+          configure(harness: ResolverHarness) {
+            harness.addSlugAlias('alice-old-soft', 'people/alice-soft-deleted');
+            harness.addSoftDeleted('people/alice-soft-deleted');
+            harness.addExact('people/alice-soft-deleted', 'source-b');
+          },
+          expected: 'alice-old-soft',
+        },
+        {
+          raw: 'alice-old-purged',
+          configure(harness: ResolverHarness) {
+            harness.addSlugAlias('alice-old-purged', 'people/alice-purged');
+            harness.addExact('people/alice-purged', 'source-b');
+          },
+          expected: 'alice-old-purged',
+        },
+        {
+          raw: 'Alice Soft',
+          configure(harness: ResolverHarness) {
+            harness.addPageAlias('alice soft', ['people/alice-soft-deleted']);
+            harness.addSoftDeleted('people/alice-soft-deleted');
+            harness.addExact('people/alice-soft-deleted', 'source-b');
+          },
+          expected: 'alice-soft',
+        },
+        {
+          raw: 'Alice Purged',
+          configure(harness: ResolverHarness) {
+            harness.addPageAlias('alice purged', ['people/alice-purged']);
+            harness.addExact('people/alice-purged', 'source-b');
+          },
+          expected: 'alice-purged',
+        },
+      ];
+
+      for (const scenario of cases) {
+        const harness = new ResolverHarness(kind);
+        scenario.configure(harness);
+
+        expect(await resolveEntitySlugWithSource(
+          harness.asEngine(),
+          'source-a',
+          scenario.raw,
+        )).toEqual({
+          slug: scenario.expected,
+          source: 'fallback_slugify',
+        });
+        expect(await resolveEntitySlug(
+          harness.asEngine(),
+          'source-a',
+          scenario.raw,
+        )).toBe(scenario.expected);
+      }
     });
 
     test('no alias rows preserve current exact, fuzzy, unambiguous-prefix, and fallback results', async () => {
@@ -350,6 +436,156 @@ test('Postgres alias reads isolate permission errors with transaction savepoints
     expect(tx.savepointCalls()).toBe(1);
     expect(await tx.sql`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
   }
+});
+
+function pinnedAliasProjectionPool() {
+  const statements: string[] = [];
+  let savepointCalls = 0;
+  let commits = 0;
+  const queryText = (strings: TemplateStringsArray) => strings.join('$');
+
+  const tx = async (
+    strings: TemplateStringsArray,
+  ): Promise<Array<Record<string, unknown>>> => {
+    statements.push(queryText(strings));
+    return [{ ok: 1 }];
+  };
+  Object.assign(tx, {
+    async savepoint<T>(fn: (nested: typeof tx) => Promise<T>): Promise<T> {
+      savepointCalls++;
+      return fn(tx);
+    },
+  });
+
+  const pool = Object.assign(async () => [], {
+    async begin<T>(fn: (nested: typeof tx) => Promise<T>): Promise<T> {
+      const result = await fn(tx);
+      commits++;
+      return result;
+    },
+  });
+
+  return {
+    pool,
+    statements,
+    savepointCalls: () => savepointCalls,
+    commits: () => commits,
+  };
+}
+
+test('Postgres alias projection nests on a pinned transaction', async () => {
+  const harness = pinnedAliasProjectionPool();
+  const engine = new PostgresEngine();
+  Object.defineProperty(engine, '_sql', { value: harness.pool });
+
+  await engine.transaction(async (scoped) => {
+    await scoped.setPageAliases('people/alice-example', 'source-a', [
+      'alice',
+      'alice example',
+    ]);
+  });
+
+  expect(harness.savepointCalls()).toBe(1);
+  expect(harness.commits()).toBe(1);
+  expect(harness.statements.some((sql) => sql.includes('DELETE FROM page_aliases'))).toBeTrue();
+  expect(harness.statements.some((sql) => sql.includes('INSERT INTO page_aliases'))).toBeTrue();
+});
+
+function concurrentDeniedProbePool() {
+  let aborted = false;
+  let commits = 0;
+  let savepointSeq = 0;
+  let maxSavepointDepth = 0;
+  const savepointStack: string[] = [];
+  const permissionDenied = (table: string) => Object.assign(
+    new Error(`permission denied for table ${table}`),
+    { code: '42501' },
+  );
+  const queryText = (strings: TemplateStringsArray) => strings.join(' ');
+
+  const tx = async (
+    strings: TemplateStringsArray,
+  ): Promise<Array<Record<string, unknown>>> => {
+    if (aborted) {
+      throw Object.assign(new Error('current transaction is aborted'), { code: '25P02' });
+    }
+    const sql = queryText(strings);
+    if (sql.includes('FROM slug_aliases')) throw permissionDenied('slug_aliases');
+    if (sql.includes('FROM page_aliases')) throw permissionDenied('page_aliases');
+    return [{ ok: 1 }];
+  };
+  Object.assign(tx, {
+    async unsafe(sql: string): Promise<Array<Record<string, unknown>>> {
+      if (aborted) {
+        throw Object.assign(new Error('current transaction is aborted'), { code: '25P02' });
+      }
+      return sql.includes('SELECT 1 AS ok') ? [{ ok: 1 }] : [];
+    },
+    async savepoint<T>(fn: (nested: typeof tx) => Promise<T>): Promise<T> {
+      const name = `s${savepointSeq++}`;
+      savepointStack.push(name);
+      maxSavepointDepth = Math.max(maxSavepointDepth, savepointStack.length);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      try {
+        const result = await fn(tx);
+        const index = savepointStack.indexOf(name);
+        if (index < 0) {
+          aborted = true;
+          throw Object.assign(new Error(`savepoint ${name} does not exist`), { code: '3B001' });
+        }
+        savepointStack.splice(index, 1);
+        return result;
+      } catch (error) {
+        const index = savepointStack.indexOf(name);
+        if (index < 0) {
+          aborted = true;
+          throw Object.assign(new Error(`savepoint ${name} does not exist`), { code: '3B001' });
+        }
+        savepointStack.splice(index);
+        throw error;
+      }
+    },
+  });
+
+  const pool = Object.assign(async () => [], {
+    async begin<T>(fn: (nested: typeof tx) => Promise<T>): Promise<T> {
+      const result = await fn(tx);
+      if (aborted) {
+        throw Object.assign(new Error('cannot commit aborted transaction'), { code: '25P02' });
+      }
+      commits++;
+      return result;
+    },
+  });
+
+  return {
+    pool,
+    commits: () => commits,
+    maxSavepointDepth: () => maxSavepointDepth,
+  };
+}
+
+test('Postgres serializes concurrent denied alias probes for the full savepoint lifecycle', async () => {
+  const harness = concurrentDeniedProbePool();
+  const engine = new PostgresEngine();
+  Object.defineProperty(engine, '_sql', { value: harness.pool });
+
+  await engine.transaction(async (scoped) => {
+    const results = await Promise.allSettled([
+      scoped.resolveSlugWithAlias('people/alice-old', 'source-a'),
+      scoped.resolveAliases(['alice'], { sourceId: 'source-a' }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(['rejected', 'rejected']);
+    expect(results.map((result) =>
+      result.status === 'rejected'
+        ? (result.reason as { code?: string }).code
+        : undefined,
+    )).toEqual(['42501', '42501']);
+    expect(await scoped.executeRaw('SELECT 1 AS ok')).toEqual([{ ok: 1 }]);
+  });
+
+  expect(harness.maxSavepointDepth()).toBe(1);
+  expect(harness.commits()).toBe(1);
 });
 
 async function expectSqlState(

@@ -134,7 +134,10 @@ export async function resolveEntitySlugWithSource(
     try {
       const redirected = await engine.resolveSlugWithAlias(trimmed, source_id);
       if (redirected !== trimmed) {
-        return { slug: redirected, source: 'alias_redirect' };
+        const liveTargets = await findLiveAliasTargets(engine, source_id, [redirected]);
+        if (liveTargets.length === 1) {
+          return { slug: liveTargets[0], source: 'alias_redirect' };
+        }
       }
     } catch (error) {
       if (!isPermissionDeniedError(error)) throw error;
@@ -167,7 +170,11 @@ export async function resolveEntitySlugWithSource(
         }
       }
 
-      const targets = Array.from(new Set(aliasRows.map((row) => row.slug).filter(Boolean))).sort();
+      const targets = await findLiveAliasTargets(
+        engine,
+        source_id,
+        aliasRows.map((row) => row.slug),
+      );
       if (targets.length === 1) {
         return { slug: targets[0], source: 'alias_match' };
       }
@@ -186,6 +193,33 @@ export async function resolveEntitySlugWithSource(
   }
 
   return withAmbiguousAliases(fallbackSlugify(trimmed), 'fallback_slugify', ambiguousAliases);
+}
+
+/**
+ * Alias rows deliberately outlive page deletion, so a target is canonical
+ * only while the same source still owns a live page for that slug. Validate
+ * all display-alias candidates in one query so ambiguity is computed over
+ * live pages only. Missing targets resume the existing resolver cascade;
+ * query failures still surface.
+ */
+async function findLiveAliasTargets(
+  engine: BrainEngine,
+  source_id: string,
+  candidates: string[],
+): Promise<string[]> {
+  const distinct = Array.from(new Set(candidates.filter(Boolean))).sort();
+  if (distinct.length === 0) return [];
+
+  const rows = await engine.executeRaw<{ slug: string }>(
+    `SELECT slug
+     FROM pages
+     WHERE source_id = $1
+       AND slug = ANY($2::text[])
+       AND deleted_at IS NULL
+     ORDER BY slug ASC`,
+    [source_id, distinct],
+  );
+  return Array.from(new Set(rows.map((row) => row.slug).filter(Boolean))).sort();
 }
 
 function isPermissionDeniedError(error: unknown): boolean {

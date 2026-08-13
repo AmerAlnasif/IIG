@@ -174,6 +174,109 @@ describe('conversation backfill entity resolution', () => {
     }
   });
 
+  test('rejects soft-deleted and purged targets from both alias lanes', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ('source-b', 'Source B')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+
+    const targets = [
+      'people/alice-soft-deleted',
+      'people/alice-purged',
+    ];
+    for (const slug of targets) {
+      await engine.putPage(slug, {
+        type: 'person',
+        title: slug,
+        compiled_truth: `# ${slug}`,
+        timeline: '',
+        frontmatter: {},
+      });
+      await engine.putPage(slug, {
+        type: 'person',
+        title: slug,
+        compiled_truth: `# ${slug} in source B`,
+        timeline: '',
+        frontmatter: {},
+      }, { sourceId: 'source-b' });
+    }
+
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+       VALUES
+         ('default', 'alice-old-soft', 'people/alice-soft-deleted'),
+         ('default', 'alice-old-purged', 'people/alice-purged')`,
+    );
+    await engine.setPageAliases(
+      'people/alice-soft-deleted',
+      'default',
+      ['alice soft'],
+    );
+    await engine.setPageAliases(
+      'people/alice-purged',
+      'default',
+      ['alice purged'],
+    );
+    await engine.softDeletePage('people/alice-soft-deleted', { sourceId: 'default' });
+    await engine.deletePage('people/alice-purged', { sourceId: 'default' });
+
+    const staleAliasFacts: ExtractedFact[] = [
+      {
+        fact: 'The soft-deleted redirect was mentioned',
+        kind: 'event',
+        entity_slug: 'alice-old-soft',
+        source: 'test',
+        source_session: null,
+        confidence: 1,
+        notability: 'medium',
+      },
+      {
+        fact: 'The purged redirect was mentioned',
+        kind: 'event',
+        entity_slug: 'alice-old-purged',
+        source: 'test',
+        source_session: null,
+        confidence: 1,
+        notability: 'medium',
+      },
+      {
+        fact: 'The soft-deleted display alias was mentioned',
+        kind: 'event',
+        entity_slug: 'Alice Soft',
+        source: 'test',
+        source_session: null,
+        confidence: 1,
+        notability: 'medium',
+      },
+      {
+        fact: 'The purged display alias was mentioned',
+        kind: 'event',
+        entity_slug: 'Alice Purged',
+        source: 'test',
+        source_session: null,
+        confidence: 1,
+        notability: 'medium',
+      },
+    ];
+
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'sessions/example',
+      types: ['conversation'],
+      sleepMs: 0,
+      extractor: extractorFor(staleAliasFacts),
+    });
+
+    expect(await dataEntities()).toEqual([
+      'alice-old-soft',
+      'alice-old-purged',
+      'alice-soft',
+      'alice-purged',
+    ]);
+    expect(result.fallback_slugify_count).toBe(4);
+  });
+
   test('best-effort resolver failure keeps the raw value and later segments checkpoint', async () => {
     await seedConversation(TWO_SEGMENT_BODY);
     const originalResolveAliases = engine.resolveAliases.bind(engine);

@@ -94,6 +94,8 @@ import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 
+const postgresRecoverableReadTails = new WeakMap<object, Promise<void>>();
+
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -1037,6 +1039,24 @@ export class PostgresEngine implements BrainEngine {
   }
 
   /**
+   * Open a top-level transaction or nest through a postgres.js savepoint when
+   * the engine is already pinned to a transaction handle.
+   */
+  private async sqlTxRaw<T>(
+    fn: (tx: postgres.TransactionSql<Record<string, never>>) => Promise<T>,
+  ): Promise<T> {
+    const conn = this.sql;
+    const reentrant = conn as unknown as {
+      begin?: (f: typeof fn) => Promise<T>;
+      savepoint?: (f: typeof fn) => Promise<T>;
+    };
+    if (typeof reentrant.begin !== 'function' && typeof reentrant.savepoint === 'function') {
+      return reentrant.savepoint(fn);
+    }
+    return conn.begin(fn) as Promise<T>;
+  }
+
+  /**
    * Run a recoverable read behind a SAVEPOINT when this engine is already
    * pinned to a transaction. PostgreSQL aborts the whole transaction after a
    * statement error such as 42501; a JavaScript catch alone cannot continue
@@ -1056,8 +1076,27 @@ export class PostgresEngine implements BrainEngine {
       ) => Promise<T>;
     };
     if (typeof reentrant.begin !== 'function' && typeof reentrant.savepoint === 'function') {
-      return reentrant.savepoint((tx) =>
-        fn(tx as unknown as ReturnType<typeof postgres>));
+      // Savepoints form a stack. Concurrent recoverable probes on the same
+      // pinned transaction can otherwise invalidate a sibling's cleanup.
+      // Serialize the complete savepoint callback per transaction handle,
+      // matching PGLite's transaction discipline.
+      const transactionKey = conn as unknown as object;
+      const previous = postgresRecoverableReadTails.get(transactionKey) ?? Promise.resolve();
+      let release!: () => void;
+      const current = new Promise<void>((resolve) => { release = resolve; });
+      const tail = previous.then(() => current);
+      postgresRecoverableReadTails.set(transactionKey, tail);
+
+      await previous;
+      try {
+        return await reentrant.savepoint((tx) =>
+          fn(tx as unknown as ReturnType<typeof postgres>));
+      } finally {
+        release();
+        if (postgresRecoverableReadTails.get(transactionKey) === tail) {
+          postgresRecoverableReadTails.delete(transactionKey);
+        }
+      }
     }
     return fn(conn);
   }
@@ -5814,9 +5853,8 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
-    const sql = this.sql;
     const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
-    await sql.begin(async tx => {
+    await this.sqlTxRaw(async tx => {
       await tx`DELETE FROM page_aliases WHERE source_id = ${sourceId} AND slug = ${slug}`;
       if (uniq.length === 0) return;
       await tx`

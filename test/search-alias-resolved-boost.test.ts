@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 16 (15→16 detail fold makes detail-contaminated rows unreachable, #3515)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(16);
+  it('is 18 (15→16 detail fold #3515; 16→18 adds the qi= qwen3 query-side instruct, so rows written before either switch become unreachable)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 });

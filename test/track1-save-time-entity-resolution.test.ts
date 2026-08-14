@@ -9,6 +9,8 @@ import {
 } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import {
+  entityResolverPolicyFromPack,
+  prepareEntityResolverPolicy,
   resolveEntitySlug,
   resolveEntitySlugWithSource,
 } from '../src/core/entities/resolve.ts';
@@ -21,12 +23,18 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 type EngineKind = 'postgres' | 'pglite';
 
 class ResolverHarness {
-  readonly exactPages = new Map<string, string>();
+  readonly exactPages = new Map<string, { slug: string; type: string; title: string }>();
   readonly softDeletedPages = new Set<string>();
   readonly slugAliases = new Map<string, string>();
   readonly pageAliases = new Map<string, string[]>();
-  readonly fuzzy = new Map<string, string>();
-  readonly prefix = new Map<string, string>();
+  readonly fuzzy = new Map<string, Array<{
+    slug: string;
+    type: string;
+    title: string;
+    score: number;
+  }>>();
+  readonly prefix = new Map<string, { slug: string; type: string }>();
+  readonly config = new Map<string, string>();
   readonly aliasRedirectCalls: Array<{
     slug: string;
     sources: string | readonly string[];
@@ -46,13 +54,18 @@ class ResolverHarness {
     return `${sourceId}|${value}`;
   }
 
-  addExact(slug: string, sourceId = this.sourceId): void {
-    this.exactPages.set(this.key(sourceId, slug), slug);
+  addExact(
+    slug: string,
+    sourceId = this.sourceId,
+    type = 'person',
+    title = slug,
+  ): void {
+    this.exactPages.set(this.key(sourceId, slug), { slug, type, title });
     this.softDeletedPages.delete(this.key(sourceId, slug));
   }
 
   addSoftDeleted(slug: string, sourceId = this.sourceId): void {
-    this.exactPages.set(this.key(sourceId, slug), slug);
+    this.exactPages.set(this.key(sourceId, slug), { slug, type: 'person', title: slug });
     this.softDeletedPages.add(this.key(sourceId, slug));
   }
 
@@ -64,12 +77,32 @@ class ResolverHarness {
     this.pageAliases.set(this.key(sourceId, aliasNorm), targets);
   }
 
-  addFuzzy(raw: string, canonical: string, sourceId = this.sourceId): void {
-    this.fuzzy.set(this.key(sourceId, raw.toLowerCase()), canonical);
+  addFuzzy(
+    raw: string,
+    canonical: string,
+    sourceId = this.sourceId,
+    type = 'person',
+    score = 0.9,
+    title = canonical,
+  ): void {
+    const key = this.key(sourceId, raw.toLowerCase());
+    const candidates = this.fuzzy.get(key) ?? [];
+    candidates.push({ slug: canonical, type, title, score });
+    candidates.sort((a, b) => b.score - a.score || a.slug.localeCompare(b.slug));
+    this.fuzzy.set(key, candidates);
   }
 
-  addPrefix(token: string, canonical: string, sourceId = this.sourceId): void {
-    this.prefix.set(this.key(sourceId, token), canonical);
+  addPrefix(
+    token: string,
+    canonical: string,
+    sourceId = this.sourceId,
+    type = 'person',
+  ): void {
+    this.prefix.set(this.key(sourceId, token), { slug: canonical, type });
+  }
+
+  async getConfig(key: string): Promise<string | null> {
+    return this.config.get(key) ?? null;
   }
 
   async executeRaw<T>(sql: string, params: unknown[] = []): Promise<T[]> {
@@ -79,36 +112,56 @@ class ResolverHarness {
       }
       const sourceId = String(params[0]);
       const slugs = Array.isArray(params[1]) ? params[1].map(String) : [];
+      const entityTypes = sql.includes('type = ANY')
+        ? new Set((params.at(-1) as string[]).map(String))
+        : null;
       return slugs
         .filter((slug) => {
           const key = this.key(sourceId, slug);
-          return this.exactPages.has(key) && !this.softDeletedPages.has(key);
+          const page = this.exactPages.get(key);
+          return page &&
+            !this.softDeletedPages.has(key) &&
+            (!entityTypes || entityTypes.has(page.type));
         })
         .map((slug) => ({ slug })) as T[];
     }
-    if (sql.includes('SELECT slug FROM pages WHERE source_id')) {
+    if (sql.includes('FROM pages') && sql.includes('slug = $2')) {
       const sourceId = String(params[0]);
       const slug = String(params[1]);
       const key = this.key(sourceId, slug);
-      const exact = this.softDeletedPages.has(key)
+      const page = this.softDeletedPages.has(key)
         ? undefined
         : this.exactPages.get(key);
-      return (exact ? [{ slug: exact }] : []) as T[];
+      const entityTypes = sql.includes('type = ANY')
+        ? new Set((params.at(-1) as string[]).map(String))
+        : null;
+      return (page && (!entityTypes || entityTypes.has(page.type))
+        ? [{ slug: page.slug }]
+        : []) as T[];
     }
     if (sql.includes('GREATEST(') && sql.includes('similarity(')) {
       this.fuzzyCalls++;
       const sourceId = String(params[0]);
       const raw = String(params[1]);
-      const slug = this.fuzzy.get(this.key(sourceId, raw));
-      return (slug ? [{ slug, title: slug, score: 0.9 }] : []) as T[];
+      const entityTypes = sql.includes('type = ANY')
+        ? new Set((params.at(-1) as string[]).map(String))
+        : null;
+      const candidates = (this.fuzzy.get(this.key(sourceId, raw)) ?? [])
+        .filter((candidate) => !entityTypes || entityTypes.has(candidate.type));
+      return candidates.map(({ slug, title, score }) => ({ slug, title, score })) as T[];
     }
     if (sql.includes('AS connection_count') && sql.includes('p.slug LIKE ANY')) {
       const sourceId = String(params[0]);
       const patterns = Array.isArray(params[1]) ? params[1].map(String) : [];
+      const entityTypes = sql.includes('type = ANY')
+        ? new Set((params.at(-1) as string[]).map(String))
+        : null;
       for (const pattern of patterns) {
         const match = pattern.match(/^(?:people|companies)\/([a-z0-9-]+)(?:-%|)$/);
-        const slug = match ? this.prefix.get(this.key(sourceId, match[1])) : undefined;
-        if (slug) return [{ slug, connection_count: 1 }] as T[];
+        const candidate = match ? this.prefix.get(this.key(sourceId, match[1])) : undefined;
+        if (candidate && (!entityTypes || entityTypes.has(candidate.type))) {
+          return [{ slug: candidate.slug, connection_count: 1 }] as T[];
+        }
       }
       return [];
     }
@@ -156,6 +209,81 @@ class ResolverHarness {
     return this as unknown as BrainEngine;
   }
 }
+
+describe('entity resolver predicate policy', () => {
+  test('no active pack uses the bundled default entity taxonomy', async () => {
+    const policy = await entityResolverPolicyFromPack(null);
+    expect(policy.entityTypes).toEqual(['person', 'company', 'yc', 'civic']);
+  });
+
+  test('empty entity declarations fail open and warn once per process', async () => {
+    _resetWarnOnceForTests();
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const emptyPack = {
+        manifest: { name: 'empty-test-pack', page_types: [] },
+      };
+      const first = await entityResolverPolicyFromPack(emptyPack);
+      const second = await entityResolverPolicyFromPack(emptyPack);
+
+      expect(first.entityTypes).toEqual(['person', 'company', 'yc', 'civic']);
+      expect(second.entityTypes).toEqual(['person', 'company', 'yc', 'civic']);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain('empty-test-pack');
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain('gbrain-base entity taxonomy');
+    } finally {
+      warnSpy.mockRestore();
+      _resetWarnOnceForTests();
+    }
+  });
+
+  test('a resolved pack with explicit entity types remains authoritative', async () => {
+    const policy = await entityResolverPolicyFromPack({
+      manifest: {
+        name: 'authoritative-test-pack',
+        page_types: [
+          { name: 'person', primitive: 'annotation' },
+          { name: 'researcher', primitive: 'entity' },
+        ],
+      },
+    });
+    expect(policy.entityTypes).toEqual(['researcher']);
+
+    const harness = new ResolverHarness('postgres');
+    harness.addExact('people/reclassified-person', 'source-a', 'person');
+    harness.addExact('experts/exact-researcher', 'source-a', 'researcher');
+    expect(await resolveEntitySlugWithSource(
+      harness.asEngine(),
+      'source-a',
+      'people/reclassified-person',
+      { policy },
+    )).toEqual({
+      slug: 'people/reclassified-person',
+      source: 'fallback_slugify',
+    });
+    expect(await resolveEntitySlugWithSource(
+      harness.asEngine(),
+      'source-a',
+      'experts/exact-researcher',
+      { policy },
+    )).toEqual({ slug: 'experts/exact-researcher', source: 'exact_page' });
+  });
+
+  test('per-source DB pack selection follows this lineage\'s dot-form key', async () => {
+    const harness = new ResolverHarness('postgres');
+    harness.config.set('schema_pack.source.source-a', 'gbrain-base-v2');
+    harness.config.set('schema_pack', 'gbrain-base');
+
+    expect((await prepareEntityResolverPolicy(
+      harness.asEngine(),
+      'source-a',
+    )).entityTypes).toEqual(['person', 'company']);
+    expect((await prepareEntityResolverPolicy(
+      harness.asEngine(),
+      'source-b',
+    )).entityTypes).toEqual(['person', 'company', 'yc', 'civic']);
+  });
+});
 
 for (const kind of ['postgres', 'pglite'] as const) {
   describe(`${kind} shared resolver contract`, () => {
@@ -375,6 +503,39 @@ for (const kind of ['postgres', 'pglite'] as const) {
         expect(tagged && 'ambiguous_aliases' in tagged).toBeFalse();
         expect(await resolveEntitySlug(harness.asEngine(), 'source-a', raw)).toBe(expected.slug);
       }
+    });
+
+    test('save seam excludes a title-colliding non-entity candidate', async () => {
+      const harness = new ResolverHarness(kind);
+      harness.addExact('aliases/alex-example', 'source-a', 'note', 'alex-example');
+      harness.addExact(
+        'people/alex-example-person',
+        'source-a',
+        'person',
+        'Alex Example',
+      );
+      harness.addFuzzy(
+        'alex-example',
+        'aliases/alex-example',
+        'source-a',
+        'note',
+        1,
+        'alex-example',
+      );
+      harness.addFuzzy(
+        'alex-example',
+        'people/alex-example-person',
+        'source-a',
+        'person',
+        0.95,
+        'Alex Example',
+      );
+
+      expect(await resolveEntitySlug(
+        harness.asEngine(),
+        'source-a',
+        'alex-example',
+      )).toBe('people/alex-example-person');
     });
   });
 }

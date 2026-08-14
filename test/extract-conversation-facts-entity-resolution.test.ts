@@ -277,6 +277,43 @@ describe('conversation backfill entity resolution', () => {
     expect(result.fallback_slugify_count).toBe(4);
   });
 
+  test('backfill excludes a title-colliding non-entity candidate', async () => {
+    await engine.putPage('aliases/alex-example', {
+      type: 'note',
+      title: 'alex-example',
+      compiled_truth: '# Alias definition',
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.putPage('people/alex-example-person', {
+      type: 'person',
+      title: 'Alex Example',
+      compiled_truth: '# Alex Example',
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'sessions/example',
+      types: ['conversation'],
+      sleepMs: 0,
+      extractor: extractorFor([{
+        fact: 'Alex Example changed roles',
+        kind: 'event',
+        entity_slug: 'alex-example',
+        source: 'test',
+        source_session: null,
+        confidence: 1,
+        notability: 'medium',
+      }]),
+    });
+
+    expect(await dataEntities()).toEqual(['people/alex-example-person']);
+    expect(result.fallback_slugify_count).toBe(0);
+    expect(result.resolution_errors).toBe(0);
+  });
+
   test('best-effort resolver failure keeps the raw value and later segments checkpoint', async () => {
     await seedConversation(TWO_SEGMENT_BODY);
     const originalResolveAliases = engine.resolveAliases.bind(engine);

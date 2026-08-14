@@ -426,12 +426,18 @@ describe('#2555 get_chunks federated scope', () => {
     expect(def.map(c => c.chunk_text)).toEqual(['default decoy chunk']);
   });
 
-  test('#2544 structural pin: neither engine SELECTs cc.* in getChunks (the trim survives merges)', async () => {
+  test('#2544 structural pin: getChunks never SELECTs cc.* and fetches cc.embedding only behind includeEmbedding', async () => {
     // The behavioral assertion above is vacuous for the trim itself —
     // rowToChunk hard-nulls embedding regardless of the SELECT. This pin
     // exists because a master merge once silently restored `SELECT cc.*`
     // while the doc comment kept claiming the trim: assert the SELECT shape
     // at the source level for BOTH engines.
+    //
+    // The vector column is not forbidden outright anymore: importCodeFile's
+    // embedding-reuse cache CONSUMES it (embed-reuse.ts), opted in via
+    // `includeEmbedding`. The invariant is unchanged in spirit and stricter
+    // in letter: no unconditional vector fetch, and the opt-in path must
+    // exist — a half-revert that strands the flag fails too.
     const { readFileSync } = await import('fs');
     for (const enginePath of ['src/core/postgres-engine.ts', 'src/core/pglite-engine.ts']) {
       const src = readFileSync(new URL(`../${enginePath}`, import.meta.url), 'utf-8');
@@ -453,8 +459,13 @@ describe('#2555 get_chunks federated scope', () => {
         'parent_symbol_path', 'doc_comment', 'symbol_name_qualified', 'modality']) {
         expect(body, `${enginePath} getChunks must select cc.${col}`).toContain(`cc.${col}`);
       }
-      // The vector columns stay unselected.
-      expect(body).not.toMatch(/cc\.embedding\b/);
+      // The vector column appears ONLY behind the includeEmbedding opt-in.
+      // Any unconditional cc.embedding is the #2544 egress regression back.
+      const vectorLines = body.split('\n').filter((l) => /cc\.embedding\b/.test(l));
+      expect(vectorLines.length, `${enginePath} getChunks must keep the includeEmbedding opt-in path`).toBeGreaterThan(0);
+      for (const line of vectorLines) {
+        expect(line, `${enginePath} getChunks must gate cc.embedding behind includeEmbedding`).toMatch(/includeEmbedding \?/);
+      }
     }
   });
 });

@@ -71,7 +71,7 @@ claude mcp add gbrain -- gbrain serve --surface verbs    # Claude Code
 codex  mcp add gbrain -- gbrain serve --surface verbs    # Codex
 ```
 
-The agent spawns `gbrain serve` as a stdio subprocess against your local brain. `--surface verbs` gives the agent the five-verb memory protocol (`recall`, `remember`, `entity`, `synthesize`, `forget` — [MEMORY_VERBS v1](protocol/MEMORY_VERBS_v1.md)) instead of the full tool catalog; drop the flag (default `full`) for every operation. Full walkthrough (both this local path and connecting to a remote brain), plus the brain-first protocol to paste into `CLAUDE.md` / `AGENTS.md`: **[Give your coding agent a memory](tutorials/connect-coding-agent.md)**.
+The agent spawns `gbrain serve` as a stdio subprocess against your local brain. `--surface verbs` gives the agent the seven-verb memory protocol (`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` — [MEMORY_VERBS v1](protocol/MEMORY_VERBS_v1.md)) instead of the full tool catalog; `--surface starter` adds the daily-driver set on top of the verbs (~26 ops total); drop the flag (default `full`) for every operation. Full walkthrough (both this local path and connecting to a remote brain), plus the brain-first protocol to paste into `CLAUDE.md` / `AGENTS.md`: **[Give your coding agent a memory](tutorials/connect-coding-agent.md)**.
 
 ## 3. MCP server (any MCP client)
 
@@ -99,6 +99,10 @@ Per-client setup guides live in [`docs/mcp/`](mcp/):
 - [`docs/mcp/CLAUDE_DESKTOP.md`](mcp/CLAUDE_DESKTOP.md)
 - [`docs/mcp/CHATGPT.md`](mcp/CHATGPT.md)
 - [`docs/mcp/PERPLEXITY.md`](mcp/PERPLEXITY.md)
+- [`docs/mcp/HERMES.md`](mcp/HERMES.md) — Hermes (Nous Research CLI)
+- [`docs/mcp/GROK.md`](mcp/GROK.md) — Grok Build (xAI CLI)
+- [`docs/mcp/OPENCLAW.md`](mcp/OPENCLAW.md) — OpenClaw (bundle plugin or stdio)
+- [`docs/mcp/CLAUDE_COWORK.md`](mcp/CLAUDE_COWORK.md) — Claude Cowork (team plan)
 - [`docs/mcp/DEPLOY.md`](mcp/DEPLOY.md) — production deploy patterns
 
 The HTTP server ships with an admin SPA at `/admin`, an SSE activity feed at `/admin/events`, DCR-style client registration, scope-gated `read`/`write`/`admin` access, and rate limiting.

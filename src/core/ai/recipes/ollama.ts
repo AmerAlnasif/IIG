@@ -12,6 +12,23 @@ export const ollama: Recipe = {
     setup_url: 'https://ollama.ai',
   },
   touchpoints: {
+    chat: {
+      // Local Ollama chat models are user-managed; this list covers common
+      // local coding/chat models for display/default-pickers only. The gateway
+      // has no runtime model allowlist, so explicit DB-selected custom local
+      // tags need no entry here.
+      models: [
+        'qwen3.6:35b-a3b-coding-mxfp8',
+        'qwen3-coder:30b',
+        'gemma4:12b',
+        'llama3.2:3b',
+        'qwen3:4b',
+        'qwen3-4b-fast',
+      ],
+      supports_tools: false,
+      supports_subagent_loop: false,
+      supports_structured_outputs: false,
+    },
     embedding: {
       // #2271: modern local embed models added so assertTouchpoint accepts them.
       models: [

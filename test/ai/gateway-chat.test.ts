@@ -60,9 +60,11 @@ describe('chat touchpoint — recipe registry', () => {
     }
   });
 
-  test('embedding-only providers (voyage, ollama) do NOT declare chat', () => {
+  test('embedding-only providers (voyage) do NOT declare chat; ollama now does', () => {
     expect(getRecipe('voyage')!.touchpoints.chat).toBeUndefined();
-    expect(getRecipe('ollama')!.touchpoints.chat).toBeUndefined();
+    // v0.43.1.0: ollama gained a chat touchpoint (local-model extract_atoms).
+    expect(getRecipe('ollama')!.touchpoints.chat).toBeDefined();
+    expect(getRecipe('ollama')!.touchpoints.chat!.models.length).toBeGreaterThan(0);
   });
 
   test('openai-compat chat recipes have base_url_default', () => {
@@ -172,8 +174,9 @@ describe('chat touchpoint — model resolver + aliases (Codex F-OV-5)', () => {
   test('assertTouchpoint rejects chat on embedding-only providers with a fix hint', () => {
     expect(() => assertTouchpoint(getRecipe('voyage')!, 'chat', 'voyage-3'))
       .toThrow(AIConfigError);
-    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'nomic-embed-text'))
-      .toThrow(AIConfigError);
+    // v0.43.1.0: ollama declares chat now — a listed local model passes.
+    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'llama3.2:3b'))
+      .not.toThrow();
   });
 
   test('assertTouchpoint accepts unlisted models on native recipes (no runtime allowlist)', () => {

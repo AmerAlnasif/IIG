@@ -111,6 +111,9 @@ type PGLiteDB = PGlite;
 // binds per row respectively.
 const PGLITE_EDGE_BATCH_MAX_BIND_PARAMS = 30_000;
 
+let pgliteRecoverableReadSavepointSeq = 0;
+const pgliteRecoverableReadTails = new WeakMap<Transaction, Promise<void>>();
+
 // Tier 3 snapshot fast-restore. Reads a tar dump produced by
 // `bun run scripts/build-pglite-snapshot.ts`. Snapshot is matched against
 // the current MIGRATIONS hash via a sidecar `.version` file; on mismatch we
@@ -1376,6 +1379,51 @@ export class PGLiteEngine implements BrainEngine {
       Object.defineProperty(txEngine, 'db', { get: () => tx });
       return fn(txEngine);
     });
+  }
+
+  /**
+   * Run a recoverable read behind a SAVEPOINT when this engine is pinned to a
+   * PGLite transaction. PGLite leaves a transaction aborted after errors such
+   * as 42501 or 42P01, and its transaction handle exposes no nested
+   * transaction/savepoint helper, so issue the lifecycle directly.
+   *
+   * Savepoints form a stack. Serialize the complete lifecycle per transaction
+   * handle so concurrent alias probes cannot invalidate each other's cleanup.
+   */
+  private async runRecoverableRead<T>(
+    fn: (db: PGLiteDB | Transaction) => Promise<T>,
+  ): Promise<T> {
+    const db = this.db as PGLiteDB | Transaction;
+    if (typeof (db as PGLiteDB).transaction === 'function') {
+      return fn(db);
+    }
+
+    const tx = db as Transaction;
+    const savepoint = `gbrain_recoverable_read_${pgliteRecoverableReadSavepointSeq++}`;
+    const previous = pgliteRecoverableReadTails.get(tx) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => current);
+    pgliteRecoverableReadTails.set(tx, tail);
+
+    await previous;
+    try {
+      await tx.exec(`SAVEPOINT ${savepoint}`);
+      try {
+        const result = await fn(tx);
+        await tx.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        return result;
+      } catch (error) {
+        await tx.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        throw error;
+      }
+    } finally {
+      release();
+      if (pgliteRecoverableReadTails.get(tx) === tail) {
+        pgliteRecoverableReadTails.delete(tx);
+      }
+    }
   }
 
   // Pages CRUD
@@ -6057,32 +6105,34 @@ export class PGLiteEngine implements BrainEngine {
       : [sourceOrSources as string];
     if (sources.length === 0) return slug;
     try {
-      // PGLite supports `= ANY($N::text[])` per pgvector / postgres semantics.
-      // ORDER BY array_position pins the federated-read precedence so the
-      // multi-source ambiguity warning is deterministic.
-      const placeholders = sources.map((_, i) => `$${i + 2}`).join(',');
-      const { rows } = await this.db.query(
-        `SELECT canonical_slug, source_id
-         FROM slug_aliases
-         WHERE alias_slug = $1
-           AND source_id IN (${placeholders})
-         ORDER BY id`,
-        [slug, ...sources],
-      );
-      if (rows.length === 0) return slug;
-      if (rows.length > 1) {
-        warnOncePerProcess(
-          `resolveSlugWithAlias:multi_match:${slug}`,
-          `[resolveSlugWithAlias] multi_match: alias '${slug}' exists in ${rows.length} sources; returning first.`,
+      return await this.runRecoverableRead(async (db) => {
+        // PGLite supports `= ANY($N::text[])` per pgvector / postgres semantics.
+        // ORDER BY array_position pins the federated-read precedence so the
+        // multi-source ambiguity warning is deterministic.
+        const placeholders = sources.map((_, i) => `$${i + 2}`).join(',');
+        const { rows } = await db.query(
+          `SELECT canonical_slug, source_id
+           FROM slug_aliases
+           WHERE alias_slug = $1
+             AND source_id IN (${placeholders})
+           ORDER BY id`,
+          [slug, ...sources],
         );
-      }
-      // Match Postgres engine: prefer rows in sourceOrSources order
-      const indexedRows = rows.map(r => ({
-        ...(r as { canonical_slug: string; source_id: string }),
-        order: sources.indexOf((r as { source_id: string }).source_id),
-      }));
-      indexedRows.sort((a, b) => a.order - b.order);
-      return indexedRows[0].canonical_slug ?? slug;
+        if (rows.length === 0) return slug;
+        if (rows.length > 1) {
+          warnOncePerProcess(
+            `resolveSlugWithAlias:multi_match:${slug}`,
+            `[resolveSlugWithAlias] multi_match: alias '${slug}' exists in ${rows.length} sources; returning first.`,
+          );
+        }
+        // Match Postgres engine: prefer rows in sourceOrSources order
+        const indexedRows = rows.map(r => ({
+          ...(r as { canonical_slug: string; source_id: string }),
+          order: sources.indexOf((r as { source_id: string }).source_id),
+        }));
+        indexedRows.sort((a, b) => a.order - b.order);
+        return indexedRows[0].canonical_slug ?? slug;
+      });
     } catch (e) {
       if (isUndefinedTableError(e)) return slug;
       throw e;
@@ -6108,7 +6158,8 @@ export class PGLiteEngine implements BrainEngine {
       q += ` AND source_id = ANY($2::text[])`;
     }
     q += ` ORDER BY alias_norm, source_id, slug`;
-    const { rows } = await this.db.query(q, params);
+    const rows = await this.runRecoverableRead(async (db) =>
+      (await db.query(q, params)).rows);
     for (const r of rows as Array<{ alias_norm: string; slug: string; source_id: string }>) {
       const list = out.get(r.alias_norm) ?? [];
       if (!list.some(x => x.slug === r.slug && x.source_id === r.source_id)) {

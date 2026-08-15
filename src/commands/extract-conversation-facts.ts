@@ -93,6 +93,10 @@ import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
 import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../core/extract/rollup-writer.ts';
+import {
+  resolveEntitySlugWithSource,
+  type ResolutionSource,
+} from '../core/entities/resolve.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables (exported for tests).
@@ -335,6 +339,10 @@ export interface ExtractConversationFactsResult {
   segments_processed: number;
   facts_extracted: number;
   facts_inserted: number;
+  /** Entity values that reached the deterministic fallback slug path. */
+  fallback_slugify_count: number;
+  /** Entity values kept raw after a best-effort resolution failure. */
+  resolution_errors: number;
   budget_exhausted?: boolean;
   spent_usd?: number;
 }
@@ -987,6 +995,7 @@ async function processPage(
   let newestEnd: string | null = null;
   let segmentsThisPage = 0;
   let pageInsertedTotal = 0;
+  const pageResolutionCounts: Partial<Record<ResolutionSource, number>> = {};
 
   for (const seg of segments) {
     if (state.segmentLimit > 0 && segmentsThisPage >= state.segmentLimit) break;
@@ -1032,6 +1041,54 @@ async function processPage(
     segmentsThisPage++;
     state.result.facts_extracted += extracted.length;
 
+    const segmentResolutionCounts: Partial<Record<ResolutionSource, number>> = {};
+    let segmentFallbackSlugifyCount = 0;
+    let segmentResolutionErrors = 0;
+
+    const commitSegmentResolutionTelemetry = () => {
+      for (const [source, count] of Object.entries(segmentResolutionCounts)) {
+        const typedSource = source as ResolutionSource;
+        pageResolutionCounts[typedSource] =
+          (pageResolutionCounts[typedSource] ?? 0) + count;
+      }
+      state.result.fallback_slugify_count += segmentFallbackSlugifyCount;
+      state.result.resolution_errors += segmentResolutionErrors;
+    };
+
+    // This bulk path bypasses the ordinary single-fact save seam and writes
+    // directly through insertFacts. Canonicalize every extractor-provided
+    // entity while the source scope and alias ambiguity are still available.
+    // Resolution stays sequential for PGLite transaction parity.
+    for (let i = 0; i < extracted.length; i++) {
+      const rawEntity = extracted[i].entity_slug;
+      if (rawEntity === null) continue;
+      try {
+        const resolved = await resolveEntitySlugWithSource(
+          state.engine,
+          state.sourceId,
+          rawEntity,
+        );
+        extracted[i] = { ...extracted[i], entity_slug: resolved?.slug ?? null };
+        if (!resolved) continue;
+        segmentResolutionCounts[resolved.source] =
+          (segmentResolutionCounts[resolved.source] ?? 0) + 1;
+        if (resolved.source === 'fallback_slugify') {
+          segmentFallbackSlugifyCount++;
+        }
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        if (err instanceof BudgetExhausted) throw err;
+        // Resolution is best-effort: preserve the extractor's raw entity and
+        // continue. Telemetry is committed only if this segment persists.
+        segmentResolutionErrors++;
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `[extract-conversation-facts] ${page.slug} segment ${seg.startIso}..${seg.endIso} ` +
+          `entity resolution failed for ${JSON.stringify(rawEntity)}: ${message}; keeping raw value\n`,
+        );
+      }
+    }
+
     if (!state.dryRun && extracted.length > 0) {
       // Eng-v2 C1 / E11: page-global row_num. Each fact in this batch gets
       // a unique row_num within (source_id, source_markdown_slug); the
@@ -1055,9 +1112,11 @@ async function processPage(
       pageInsertedTotal += ins.inserted;
       state.result.facts_inserted += ins.inserted;
       rowNum += extracted.length;
+      commitSegmentResolutionTelemetry();
     } else {
       // dry-run: count for reporting, no DB write.
       rowNum += extracted.length;
+      commitSegmentResolutionTelemetry();
     }
 
     newestEnd = seg.endIso;
@@ -1102,8 +1161,20 @@ async function processPage(
     state.cpMap.set(cpMapKey(state.sourceId, page.slug), newestEnd);
   }
 
+  const orderedResolutionCounts: Partial<Record<ResolutionSource, number>> = {};
+  for (const source of [
+    'exact_page',
+    'alias_redirect',
+    'alias_match',
+    'fuzzy_match',
+    'fallback_slugify',
+  ] as const) {
+    const count = pageResolutionCounts[source];
+    if (count) orderedResolutionCounts[source] = count;
+  }
   process.stderr.write(
-    `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments\n`,
+    `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments ` +
+    `entity_resolution_counts=${JSON.stringify(orderedResolutionCounts)}\n`,
   );
 
   state.result.pages_processed++;
@@ -1194,6 +1265,8 @@ export async function runExtractConversationFactsCore(
     segments_processed: 0,
     facts_extracted: 0,
     facts_inserted: 0,
+    fallback_slugify_count: 0,
+    resolution_errors: 0,
   };
 
   // F2: honor brain-wide kill-switch unless overridden.
@@ -1807,6 +1880,8 @@ export async function runExtractConversationFacts(
     segments_processed: 0,
     facts_extracted: 0,
     facts_inserted: 0,
+    fallback_slugify_count: 0,
+    resolution_errors: 0,
   };
   let totalSpent = 0;
   let anyBudgetExhausted = false;
@@ -1852,6 +1927,8 @@ export async function runExtractConversationFacts(
       aggregate.segments_processed += perSource.segments_processed;
       aggregate.facts_extracted += perSource.facts_extracted;
       aggregate.facts_inserted += perSource.facts_inserted;
+      aggregate.fallback_slugify_count += perSource.fallback_slugify_count;
+      aggregate.resolution_errors += perSource.resolution_errors;
       if (perSource.budget_exhausted) anyBudgetExhausted = true;
       if (perSource.spent_usd) totalSpent += perSource.spent_usd;
 
@@ -1899,6 +1976,12 @@ export async function runExtractConversationFacts(
   if (aggregate.orphan_facts_cleaned > 0) {
     console.log(`  Cleaned ${aggregate.orphan_facts_cleaned} orphan fact(s) from prior partial runs (D11 replay safety).`);
   }
+  if (aggregate.fallback_slugify_count > 0) {
+    console.log(`  Minted ${aggregate.fallback_slugify_count} entity slug(s) via fallback_slugify.`);
+  }
+  if (aggregate.resolution_errors > 0) {
+    console.log(`  Kept ${aggregate.resolution_errors} raw entity value(s) after best-effort resolution errors.`);
+  }
   if (anyBudgetExhausted) {
     console.log(`  Budget cap reached. Re-run with a higher --max-cost-usd to continue.`);
   }
@@ -1937,7 +2020,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isAbortError(err: unknown): boolean {
+export function isAbortError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === 'AbortError' || /aborted|cancell?ed/i.test(err.message);
 }

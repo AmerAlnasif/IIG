@@ -22,16 +22,19 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { normalizeAlias } from '../search/alias-normalize.ts';
+import { isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
  *
  * Resolution order:
- *   1. If `raw` is already a page slug shape (contains a "/" or matches an
- *      exact pages.slug row in this source), return it untouched.
- *   2. Resolve a bare name only when prefix expansion finds one candidate.
- *   3. For multi-token input, require a high-specificity fuzzy match against
- *      pages.slug + pages.title within the source (case-insensitive).
+ *   1. For slug-shaped input, prefer an exact live page, then a source-scoped
+ *      old-slug redirect from `slug_aliases`.
+ *   2. Try an exact normalized, source-scoped `page_aliases` match. Ambiguous
+ *      aliases are recorded and fall through without guessing.
+ *   3. Preserve the hardened resolver cascade: bare names expand only when
+ *      globally unambiguous; multi-token input requires a 0.7 fuzzy match.
  *   4. Fall back to a deterministic slugify: lowercase-no-spaces with
  *      hyphen-collapse. NOT prefixed with a directory — caller decides
  *      whether to prefix `people/`, `companies/`, etc.
@@ -43,38 +46,10 @@ export async function resolveEntitySlug(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  opts: ResolveEntitySlugOptions = {},
 ): Promise<string | null> {
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  // 1. Exact match on slug. If raw already looks like a slug (or matches
-  //    a row exactly), use it.
-  if (looksLikeSlug(trimmed)) {
-    const exact = await tryExactSlug(engine, source_id, trimmed);
-    if (exact) return exact;
-  }
-
-  // 2. Prefix-expansion match: when the input looks like a bare first name
-  //    (no slash, no prefix, slugifies to a single short token), try
-  //    `people/<token>-%` then `companies/<token>-%`. Short bare names
-  //    score terribly on pg_trgm — similarity('alice', 'alice-example')
-  //    is below the fuzzy threshold — so this is the layer that catches
-  //    `"Alice"` → `people/alice-example` before we phantom-stub a bare
-  //    `people/alice.md`.
-  if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
-    if (expanded) return expanded;
-  } else {
-    // 3. Fuzzy match against existing pages within the source. Bare names
-    //    deliberately skip this arm: a shared first name is not specific
-    //    enough to choose one person by trigram score or popularity.
-    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
-    if (fuzzy) return fuzzy;
-  }
-
-  // 4. Fallback: deterministic slugify.
-  return fallbackSlugify(trimmed);
+  const resolved = await resolveEntitySlugWithSource(engine, source_id, raw, opts);
+  return resolved?.slug ?? null;
 }
 
 /**
@@ -116,47 +91,298 @@ const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
 /**
  * v0.40.2.0 — resolution-source-tagged variant for trajectory routing.
  *
- * Same resolution chain as `resolveEntitySlug` but returns the source
- * (`exact_page` | `fuzzy_match` | `fallback_slugify`) alongside the slug
- * so trajectory callers can gate on `resolution_source !==
- * 'fallback_slugify'` — querying findTrajectory on an invented slug
- * always returns [] and wastes a SQL round-trip. Codex Problem 5 from
- * v0.40.2.0 outside-voice review.
+ * Same resolution chain as `resolveEntitySlug` but returns the source tag
+ * alongside the slug so trajectory callers can distinguish existing pages,
+ * alias hits, and invented fallback slugs. Querying findTrajectory on an
+ * invented slug always returns [] and wastes a SQL round-trip. Codex Problem
+ * 5 from v0.40.2.0 outside-voice review.
  *
  * The original `resolveEntitySlug` keeps its existing contract (returns
  * just the slug) for all pre-v0.40 call sites — no caller-side churn.
  */
-export type ResolutionSource = 'exact_page' | 'fuzzy_match' | 'fallback_slugify';
+export type ResolutionSource =
+  | 'exact_page'
+  | 'alias_redirect'
+  | 'alias_match'
+  | 'fuzzy_match'
+  | 'fallback_slugify';
 
 export interface ResolveResult {
   slug: string;
   source: ResolutionSource;
+  /** Present only when a colliding page alias fell through to the old cascade. */
+  ambiguous_aliases?: string[];
+}
+
+export interface ResolveEntitySlugOptions {
+  policy?: EntityResolverPolicy;
+}
+
+export interface EntityResolverPolicy {
+  readonly entityTypes: readonly string[];
+}
+
+interface EntityResolverPackView {
+  readonly manifest: {
+    readonly name?: string;
+    readonly page_types?: ReadonlyArray<{
+      readonly name: string;
+      readonly primitive?: string;
+    }>;
+  };
+}
+
+let defaultEntityResolverPolicyPromise: Promise<EntityResolverPolicy> | undefined;
+
+function entityTypesFromPack(pack: EntityResolverPackView): string[] {
+  const pageTypes = Array.isArray(pack.manifest.page_types)
+    ? pack.manifest.page_types
+    : [];
+  return pageTypes
+    .filter((pageType) => pageType.primitive === 'entity')
+    .map((pageType) => pageType.name);
+}
+
+async function getDefaultEntityResolverPolicy(): Promise<EntityResolverPolicy> {
+  if (!defaultEntityResolverPolicyPromise) {
+    defaultEntityResolverPolicyPromise = (async () => {
+      const { loadActivePack } = await import('../schema-pack/load-active.ts');
+      const pack = await loadActivePack({
+        cfg: null,
+        remote: false,
+        perCall: 'gbrain-base',
+      });
+      const entityTypes = entityTypesFromPack(pack);
+      if (entityTypes.length === 0) {
+        throw new Error('canonical gbrain-base schema pack declares no entity page types');
+      }
+      return Object.freeze({
+        entityTypes: Object.freeze(entityTypes),
+      });
+    })().catch((error) => {
+      defaultEntityResolverPolicyPromise = undefined;
+      throw error;
+    });
+  }
+  return defaultEntityResolverPolicyPromise;
+}
+
+/**
+ * Derive the page-type predicate for every page-backed resolver candidate.
+ * Explicit entity declarations remain authoritative. An unavailable pack or
+ * a resolved pack with no entity types fails open to the bundled gbrain-base
+ * taxonomy, preserving the resolver's pre-schema-pack behavior.
+ */
+export async function entityResolverPolicyFromPack(
+  pack: EntityResolverPackView | null | undefined,
+): Promise<EntityResolverPolicy> {
+  if (!pack) return getDefaultEntityResolverPolicy();
+
+  const entityTypes = entityTypesFromPack(pack);
+  if (entityTypes.length > 0) {
+    return { entityTypes: Object.freeze(entityTypes) };
+  }
+
+  const packName = pack.manifest.name ?? '<unnamed>';
+  warnOncePerProcess(
+    'resolveEntitySlug:no_entity_page_types',
+    `[entity-resolver] WARNING: active schema pack "${packName}" declares no entity page_types. ` +
+      'Using the built-in gbrain-base entity taxonomy for resolver candidates. ' +
+      'Further empty-entity-pack warnings are suppressed for this process.',
+  );
+  return getDefaultEntityResolverPolicy();
+}
+
+/**
+ * Resolve the active pack for this source and convert its structural
+ * `primitive: entity` declarations into the resolver predicate. This lineage
+ * stores per-source pack selection under `schema_pack.source.<id>`.
+ */
+export async function prepareEntityResolverPolicy(
+  engine: BrainEngine,
+  source_id: string,
+): Promise<EntityResolverPolicy> {
+  try {
+    const { loadConfig } = await import('../config.ts');
+    const { loadActivePack } = await import('../schema-pack/load-active.ts');
+
+    let perSourcePack: string | undefined;
+    let brainWidePack: string | undefined;
+    if (typeof engine.getConfig === 'function') {
+      [perSourcePack, brainWidePack] = await Promise.all([
+        engine.getConfig(`schema_pack.source.${source_id}`).then((value) => value ?? undefined),
+        engine.getConfig('schema_pack').then((value) => value ?? undefined),
+      ]);
+    }
+
+    const pack = await loadActivePack({
+      cfg: loadConfig(),
+      remote: true,
+      sourceId: source_id,
+      perSourceDb: perSourcePack
+        ? new Map([[source_id, perSourcePack]])
+        : undefined,
+      dbConfig: brainWidePack,
+    });
+    return entityResolverPolicyFromPack(pack);
+  } catch {
+    return entityResolverPolicyFromPack(null);
+  }
 }
 
 export async function resolveEntitySlugWithSource(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  opts: ResolveEntitySlugOptions = {},
 ): Promise<ResolveResult | null> {
   if (!raw) return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
+  const policy = opts.policy ?? await prepareEntityResolverPolicy(engine, source_id);
+  const entityTypes = policy.entityTypes;
 
-  // Mirror resolveEntitySlug's resolution chain but tag each branch.
+  let ambiguousAliases: string[] | undefined;
+  let aliasPermissionDenied = false;
+
+  // Slug-shaped input: an active page remains authoritative. If the old slug
+  // page was retired, consult the source-scoped redirect table next.
   if (looksLikeSlug(trimmed)) {
-    const exact = await tryExactSlug(engine, source_id, trimmed);
+    const exact = await tryExactSlug(engine, source_id, trimmed, entityTypes);
     if (exact) return { slug: exact, source: 'exact_page' };
+
+    try {
+      const redirected = await engine.resolveSlugWithAlias(trimmed, source_id);
+      if (redirected !== trimmed) {
+        const liveTargets = await findLiveAliasTargets(
+          engine,
+          source_id,
+          [redirected],
+          entityTypes,
+        );
+        if (liveTargets.length === 1) {
+          return { slug: liveTargets[0], source: 'alias_redirect' };
+        }
+      }
+    } catch (error) {
+      if (!isPermissionDeniedError(error)) throw error;
+      warnAliasPermissionDenied('slug_aliases', error);
+      aliasPermissionDenied = true;
+    }
   }
 
+  // page_aliases permits collisions. A single distinct target is safe;
+  // multiple targets are surfaced as metadata and the hardened v0.45.7
+  // prefix/fuzzy/fallback cascade decides without guessing between aliases.
+  // If slug_aliases was permission-denied, skip this second alias probe so the
+  // surrounding transaction can resume the pre-alias cascade immediately.
+  if (!aliasPermissionDenied) {
+    const aliasNorm = normalizeAlias(trimmed);
+    if (aliasNorm) {
+      let aliasRows: Array<{ slug: string; source_id: string }> = [];
+      try {
+        const matches = await engine.resolveAliases([aliasNorm], { sourceId: source_id });
+        aliasRows = matches.get(aliasNorm) ?? [];
+      } catch (error) {
+        // Pre-v110 brains retain the old cascade. SQLSTATE 42501 also falls
+        // back when the connecting role cannot read the alias tables.
+        if (isUndefinedTableError(error)) {
+          // Keep the pre-v110 behavior unchanged.
+        } else if (isPermissionDeniedError(error)) {
+          warnAliasPermissionDenied('page_aliases', error);
+        } else {
+          throw error;
+        }
+      }
+
+      const targets = await findLiveAliasTargets(
+        engine,
+        source_id,
+        aliasRows.map((row) => row.slug),
+        entityTypes,
+      );
+      if (targets.length === 1) {
+        return { slug: targets[0], source: 'alias_match' };
+      }
+      if (targets.length > 1) ambiguousAliases = targets;
+    }
+  }
+
+  // Preserve the current safe cascade: bare names only expand when globally
+  // unambiguous, while multi-token input uses the current 0.7 fuzzy floor.
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
-    if (expanded) return { slug: expanded, source: 'fuzzy_match' };
+    const expanded = await tryUnambiguousPrefixExpansion(
+      engine,
+      source_id,
+      slugify(trimmed),
+      policy,
+    );
+    if (expanded) return withAmbiguousAliases(expanded, 'fuzzy_match', ambiguousAliases);
   } else {
-    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
-    if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, entityTypes);
+    if (fuzzy) return withAmbiguousAliases(fuzzy, 'fuzzy_match', ambiguousAliases);
   }
 
-  return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+  return withAmbiguousAliases(fallbackSlugify(trimmed), 'fallback_slugify', ambiguousAliases);
+}
+
+/**
+ * Alias rows deliberately outlive page deletion, so a target is canonical
+ * only while the same source still owns a live page for that slug. Validate
+ * all display-alias candidates in one query so ambiguity is computed over
+ * live pages only. Missing targets resume the existing resolver cascade;
+ * query failures still surface.
+ */
+async function findLiveAliasTargets(
+  engine: BrainEngine,
+  source_id: string,
+  candidates: string[],
+  entityTypes: readonly string[],
+): Promise<string[]> {
+  const distinct = Array.from(new Set(candidates.filter(Boolean))).sort();
+  if (distinct.length === 0) return [];
+
+  const rows = await engine.executeRaw<{ slug: string }>(
+    `SELECT slug
+     FROM pages
+     WHERE source_id = $1
+       AND slug = ANY($2::text[])
+       AND deleted_at IS NULL
+       AND type = ANY($3::text[])
+     ORDER BY slug ASC`,
+    [source_id, distinct, entityTypes],
+  );
+  return Array.from(new Set(rows.map((row) => row.slug).filter(Boolean))).sort();
+}
+
+function isPermissionDeniedError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; sqlState?: unknown };
+  return String(candidate.code ?? candidate.sqlState ?? '') === '42501';
+}
+
+function warnAliasPermissionDenied(
+  table: 'slug_aliases' | 'page_aliases',
+  error: unknown,
+): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  warnOncePerProcess(
+    'resolveEntitySlug:alias_permission_denied',
+    `[entity-resolver] WARNING: alias lookup permission denied (SQLSTATE 42501 while reading ${table}: ${detail}). ` +
+      'Continuing with the pre-alias fuzzy/prefix/fallback cascade; canonical alias matches may be missed. ' +
+      'The connecting role needs SELECT (and any applicable row-security policy) on slug_aliases and page_aliases. ' +
+      'Further alias-permission warnings are suppressed for this process.',
+  );
+}
+
+function withAmbiguousAliases(
+  slug: string,
+  source: ResolutionSource,
+  ambiguousAliases: string[] | undefined,
+): ResolveResult {
+  return ambiguousAliases
+    ? { slug, source, ambiguous_aliases: ambiguousAliases }
+    : { slug, source };
 }
 
 /**
@@ -181,17 +407,24 @@ export async function resolvePhantomCanonical(
   engine: BrainEngine,
   source_id: string,
   phantomSlug: string,
+  policy?: EntityResolverPolicy,
 ): Promise<string | null> {
   if (!phantomSlug) return null;
   const trimmed = phantomSlug.trim();
   if (!trimmed) return null;
+  const entityTypes = (policy ?? await prepareEntityResolverPolicy(engine, source_id)).entityTypes;
   // The phantom slug is the input; we treat it as the search term too,
   // because phantom slugs ARE the lowercased bare name a fuzzy / prefix
   // lookup would naturally target.
-  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
+  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, entityTypes);
   if (fuzzy && fuzzy !== phantomSlug && fuzzy.includes('/')) return fuzzy;
 
-  const expanded = await tryPrefixExpansion(engine, source_id, slugify(trimmed));
+  const expanded = await tryPrefixExpansion(
+    engine,
+    source_id,
+    slugify(trimmed),
+    entityTypes,
+  );
   if (expanded && expanded !== phantomSlug && expanded.includes('/')) return expanded;
 
   return null;
@@ -216,8 +449,10 @@ export async function findPrefixCandidates(
   engine: BrainEngine,
   source_id: string,
   token: string,
+  policy?: EntityResolverPolicy,
 ): Promise<Array<{ slug: string; connection_count: number }>> {
   if (!token) return [];
+  const entityTypes = (policy ?? await prepareEntityResolverPolicy(engine, source_id)).entityTypes;
   // Build LIKE pattern set for each configured directory:
   //   people/<token>      (bare child — covers `people/alice` exactly)
   //   people/<token>-%    (suffixed child — covers `people/alice-example`)
@@ -243,9 +478,10 @@ export async function findPrefixCandidates(
        WHERE p.source_id = $1
          AND p.deleted_at IS NULL
          AND p.slug LIKE ANY($2::text[])
+         AND p.type = ANY($3::text[])
        ORDER BY connection_count DESC, p.slug ASC
        LIMIT 10`,
-      [source_id, patterns],
+      [source_id, patterns, entityTypes],
     );
     return rows;
   } catch {
@@ -261,8 +497,9 @@ async function tryUnambiguousPrefixExpansion(
   engine: BrainEngine,
   source_id: string,
   token: string,
+  policy: EntityResolverPolicy,
 ): Promise<string | null> {
-  const candidates = await findPrefixCandidates(engine, source_id, token);
+  const candidates = await findPrefixCandidates(engine, source_id, token, policy);
   return candidates.length === 1 ? candidates[0].slug : null;
 }
 
@@ -278,6 +515,7 @@ async function tryPrefixExpansion(
   engine: BrainEngine,
   source_id: string,
   token: string,
+  entityTypes: readonly string[],
 ): Promise<string | null> {
   for (const dir of PREFIX_EXPANSION_DIRS) {
     const pattern = `${dir}/${token}-%`;
@@ -312,9 +550,10 @@ async function tryPrefixExpansion(
          WHERE p.source_id = $1
            AND p.deleted_at IS NULL
            AND p.slug LIKE $2
+           AND p.type = ANY($3::text[])
          ORDER BY connection_count DESC, p.slug ASC
          LIMIT 5`,
-        [source_id, pattern],
+        [source_id, pattern, entityTypes],
       );
       if (rows.length === 0) continue;
       // Single unambiguous match: return it.
@@ -344,11 +583,18 @@ async function tryExactSlug(
   engine: BrainEngine,
   source_id: string,
   candidate: string,
+  entityTypes: readonly string[],
 ): Promise<string | null> {
   try {
     const rows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
-      [source_id, candidate],
+      `SELECT slug
+       FROM pages
+       WHERE source_id = $1
+         AND slug = $2
+         AND deleted_at IS NULL
+         AND type = ANY($3::text[])
+       LIMIT 1`,
+      [source_id, candidate, entityTypes],
     );
     if (rows.length > 0) return rows[0].slug;
   } catch {
@@ -361,6 +607,7 @@ async function tryFuzzyMatch(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  entityTypes: readonly string[],
 ): Promise<string | null> {
   const lc = raw.toLowerCase();
   const fragment = slugify(raw);
@@ -377,13 +624,14 @@ async function tryFuzzyMatch(
        FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
+         AND type = ANY($4::text[])
          AND (
            lower(title) % $2
            OR slug ILIKE '%' || $3 || '%'
          )
        ORDER BY score DESC, slug ASC
        LIMIT 3`,
-      [source_id, lc, fragment],
+      [source_id, lc, fragment, entityTypes],
     );
     // 0.4 confidently misattributes names that share only a generic company
     // token (for example "Beacon Capital" → "Benton Capital"). Keep fuzzy

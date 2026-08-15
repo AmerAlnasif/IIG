@@ -132,7 +132,9 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
                                   Receipt-keyed removal. The repo stays yours.
 
 Global flags: --workspace <dir> (default: cwd; refuses if the resolved
-             path is your home directory), --help.
+             path is your home directory — status/uninstall are exempt so
+             an existing $HOME install can still be inspected and removed),
+             --help.
 Env: GBRAIN_BOOTSTRAP_ABORT_AFTER=<phase> (test seam — abort after that phase's work).
 `;
 
@@ -236,8 +238,22 @@ function flagValues(args: string[], flag: string): string[] {
  * sensitive dotfile `$HOME` may hold, e.g. `~/.ssh/`). Refuse outright rather
  * than attempt to enumerate every risky path — the fix is a real project
  * directory, not a bigger ignore list [HOME_WORKSPACE].
+ *
+ * `HOME_WORKSPACE_GUARD_EXEMPT` carves out the two subcommands that never
+ * do any of that: `status` only reads and prints a report, and `uninstall`
+ * removes EXACTLY `receipt.created_paths` (each containment-checked, see
+ * `core/bootstrap/uninstall.ts`) — never a `git add`/commit/push, never a
+ * workspace-wide scan. Exempting them keeps the recovery path reachable for
+ * the guard's own victims: someone who already bootstrapped into `$HOME`
+ * before this guard existed needs `status` to see what's there and
+ * `uninstall` to remove it, both run with `--workspace` pointing AT `$HOME`.
+ * Every other subcommand (`interview`/`render`/`repo`/`hooks`/`verify`/
+ * `attach`) stages, commits, pushes, or writes identity/registration files
+ * into the workspace, so they stay refused.
  */
-function resolveWorkspace(args: string[]): string {
+const HOME_WORKSPACE_GUARD_EXEMPT = new Set(['status', 'uninstall']);
+
+function resolveWorkspace(args: string[], sub: string): string {
   const ws = flagValue(args, '--workspace');
   const resolved = ws ? resolve(ws) : process.cwd();
   const resolvedReal = realpathOrResolve(resolved);
@@ -254,11 +270,13 @@ function resolveWorkspace(args: string[]): string {
   // strings) so a symlinked $HOME or a symlinked cwd (e.g. macOS's
   // /var -> /private/var tmp roots) still matches.
   const home = process.env.HOME || homedir();
-  if (home && realpathOrResolve(home) === resolvedReal) {
+  if (!HOME_WORKSPACE_GUARD_EXEMPT.has(sub) && home && realpathOrResolve(home) === resolvedReal) {
     throw new BootstrapError(
       'HOME_WORKSPACE',
       `refusing to bootstrap directly into your home directory (${resolved}) — SSH sessions often land here by default. ` +
-        're-run with `--workspace <dir>` pointing at the project directory you want to bootstrap, not your home directory itself.',
+        'If you already bootstrapped here, `gbrain bootstrap status` and `gbrain bootstrap uninstall` still work ' +
+        'directly at $HOME to inspect and remove it; otherwise re-run with `--workspace <dir>` pointing at the ' +
+        'project directory you actually want to bootstrap.',
       { details: { candidate: resolved } },
     );
   }
@@ -1418,7 +1436,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
 
   let ws: string;
   try {
-    ws = resolveWorkspace(rest);
+    ws = resolveWorkspace(rest, sub);
   } catch (e) {
     if (e instanceof BootstrapError) {
       console.error(e.message);

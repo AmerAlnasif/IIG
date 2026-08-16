@@ -1171,6 +1171,10 @@ export async function doctorReportRemote(
   // 716K-chunk damage incident from PR #1421's description.
   checks.push(await checkEmbeddingEnvOverride(engine));
 
+  // Surface the migration state marker (previously write-only): a live
+  // marker = mid-migration brain, with the exact resume + status commands.
+  checks.push(await checkEmbeddingMigrationState(engine));
+
   // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
   // The subagent loop requires native tool-calling. If models.subagent,
   // models.tier.subagent, or models.default resolves to a limited provider, warn here
@@ -2796,21 +2800,18 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
             : `embedding_model="${model}": the hosted API shut down on ${ZEROENTROPY_SUNSET_DATE}. No embedded vectors exist yet, so retrieval is not impacted — but embedding will fail until the config points elsewhere.`
           : `embedding_model="${model}": the hosted API shuts down on ${ZEROENTROPY_SUNSET_DATE}. On that date semantic retrieval stops entirely — existing vectors become unqueryable (query embedding uses the same endpoint), not just new content.`,
       );
-      // v0.46.3: the paste-ready fix is TARGET-AWARE on dimensions. Voyage's
-      // valid widths are {256, 512, 1024, 2048} — blindly preserving this
-      // brain's actual width (usually 1280) would emit a command Voyage
-      // rejects. OpenAI text-3 supports flexible widths up to its native
-      // size, so the keep-width form is offered only when valid there.
-      const openaiDimFlag = dims && dims <= 1536 ? ` --dim ${dims}` : ' --dim 1536';
-      const openaiKeepsWidth = !!(dims && dims <= 1536);
+      // v0.46.3: the paste-ready fix is TARGET-AWARE on dimensions via the
+      // canonical renderer (defaults.ts) — Voyage's valid widths are
+      // {256, 512, 1024, 2048}, so the recommended command always carries
+      // --dim 1024; the keep-width OpenAI form renders only when valid there.
+      const { renderCanonicalMigrationCommands } = await import('../core/ai/defaults.ts');
+      const cmds = renderCanonicalMigrationCommands({ colDims: dims ?? null });
       parts.push(
         `Two fixes, either works: ` +
         `[1] self-host the same model — zembed-1 weights are Apache-2.0; keep the zeroentropyai:zembed-1 id and point provider_base_urls.zeroentropyai at a ZE-wire-compatible endpoint (NOT a generic OpenAI-compatible server — the id speaks ZE's /models/embed dialect). Keeps every existing vector, no re-embed (docs/guides/embedding-migration.md). ` +
-        `[2] migrate (resumable; preview cost first): ` +
-        `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run` +
-        (dims && dims !== 1024 ? ` (${dims} is not a valid Voyage width — the migration rebuilds the index at 1024)` : '') +
-        `; OpenAI alternative${openaiKeepsWidth ? ` keeps this brain's ${dims}d width` : ''}: ` +
-        `gbrain migrate embeddings --to openai:text-embedding-3-small${openaiDimFlag} --dry-run.`,
+        `[2] migrate (resumable; preview cost first): ${cmds.recommendedDryRun}` +
+        (cmds.note ? ` ${cmds.note}` : '') +
+        (cmds.openaiAlternative ? ` Keep-width alternative: ${cmds.openaiAlternative}.` : ''),
       );
     }
     if (onSunsetReranker) {
@@ -3537,10 +3538,15 @@ async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
     mismatches.push({ key: 'GBRAIN_EMBEDDING_DIMENSIONS', env: envDim, db: dbDim });
   }
   if (mismatches.length === 0) {
+    // Informational nuance (D10): agreeing env vars are still an override —
+    // the file plane is the durable home; say so instead of a bare ok.
+    const envSet = Boolean(envModel || envDim);
     return {
       name: 'embedding_env_override',
       status: 'ok',
-      message: 'env vars agree with DB config',
+      message: envSet
+        ? 'env vars agree with DB config today — note they override the file plane at runtime; prefer the file plane (or keep env in sync everywhere gbrain runs)'
+        : 'env vars agree with DB config',
     };
   }
   return {
@@ -3552,6 +3558,53 @@ async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
       `or update DB config to match.`,
     details: { mismatches },
   };
+}
+
+/**
+ * Surface the (previously write-only) embedding-migration state marker: a
+ * live marker means a migration is in flight or was interrupted — the brain
+ * is mid-transition and retrieval may be degraded until it drains. Warn with
+ * the exact resume + status commands.
+ */
+export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise<Check> {
+  try {
+    const { readMigrationState, migrationSignature, renderResumeCommand } = await import('../core/embedding-migration.ts');
+    const marker = await readMigrationState(engine);
+    if (marker.corrupt) {
+      return {
+        name: 'embedding_migration_state',
+        status: 'warn',
+        message: 'embedding-migration state marker is corrupt. Inspect: gbrain migrate embeddings --status; re-running the migration rewrites it.',
+      };
+    }
+    if (!marker.state) {
+      return { name: 'embedding_migration_state', status: 'ok', message: 'no embedding migration in flight' };
+    }
+    const s = marker.state;
+    let staleNote = '';
+    try {
+      const stale = await engine.countStaleChunks({
+        signature: migrationSignature(s.to_model, s.to_dims),
+        includeNullSignature: true,
+      });
+      staleNote = `; ${stale} chunk(s) not yet in the target space`;
+    } catch { /* count is best-effort */ }
+    return {
+      name: 'embedding_migration_state',
+      status: 'warn',
+      message:
+        `an embedding migration to ${s.to_model} (${s.to_dims}d) started ${s.started_at} is in flight or was interrupted${staleNote}. ` +
+        `Resume: ${renderResumeCommand(s)}. ` +
+        `Status: gbrain migrate embeddings --status`,
+      details: { to_model: s.to_model, to_dims: s.to_dims, started_at: s.started_at },
+    };
+  } catch (err) {
+    return {
+      name: 'embedding_migration_state',
+      status: 'warn',
+      message: `could not read migration state: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 export async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
@@ -6994,12 +7047,26 @@ export async function buildChecks(
   try {
     const health = await engine.getHealth();
     const pct = (health.embed_coverage * 100).toFixed(0);
+    // Coverage + missing now share one source (the stored vector over
+    // eligible chunks), so the two numbers can no longer contradict each
+    // other. When the READ path rides a custom active column, say so — this
+    // check reports the default write-side column; the active-column truth
+    // lives in embedding_column_registry.
+    let carveOut = '';
+    try {
+      const activeCol = await engine.getConfig('search_embedding_column');
+      if (activeCol && activeCol !== 'embedding') {
+        carveOut = ` (read path uses '${activeCol}'; see embedding_column_registry)`;
+      }
+    } catch {
+      // Config read is best-effort; the coverage numbers stand alone.
+    }
     if (health.embed_coverage >= 0.9) {
-      checks.push({ name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${health.missing_embeddings} missing` });
+      checks.push({ name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${health.missing_embeddings} missing${carveOut}` });
     } else if (health.embed_coverage > 0) {
-      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed --stale` });
+      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed --stale${carveOut}` });
     } else {
-      checks.push({ name: 'embeddings', status: 'warn', message: 'No embeddings yet. Run: gbrain embed --stale' });
+      checks.push({ name: 'embeddings', status: 'warn', message: `No embeddings yet. Run: gbrain embed --stale${carveOut}` });
     }
   } catch {
     checks.push({ name: 'embeddings', status: 'warn', message: 'Could not check embedding health' });
@@ -7298,11 +7365,13 @@ export async function buildChecks(
         // Only warn when there's a real coverage gap. Empty brain (0 chunks)
         // is a normal state for new installs — skip the gate entirely.
         if (total > 0 && pct < 90) {
+          // NOTE: there is NO per-column embed flag (write-side custom-column
+          // support is a filed follow-up) — the old hint prescribed one.
           coverageWarn =
             `Active column '${activeCol}' is ${pct.toFixed(1)}% populated. ` +
             `Search quality silently degraded on un-embedded chunks. ` +
-            `Fix: gbrain embed --column ${activeCol} --stale (write-side support v2) ` +
-            `OR gbrain config set search_embedding_column embedding`;
+            `Fix: gbrain config set search_embedding_column embedding (read the default column), ` +
+            `then gbrain embed --stale; per-column write-side backfill is a filed follow-up (TODOS.md)`;
         }
       }
 
@@ -7342,6 +7411,10 @@ export async function buildChecks(
   //     checkEmbeddingEnvOverride() helper.
   progress.heartbeat('embedding_env_override');
   checks.push(await checkEmbeddingEnvOverride(engine));
+
+  // Surface the migration state marker (previously write-only): a live
+  // marker = mid-migration brain, with the exact resume + status commands.
+  checks.push(await checkEmbeddingMigrationState(engine));
 
   // 9. Graph health (link + timeline coverage on entity pages).
   // dead_links removed in v0.10.1: ON DELETE CASCADE on link FKs makes it always 0.

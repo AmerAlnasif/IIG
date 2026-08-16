@@ -178,15 +178,28 @@ describe('resolveModel — v0.31.12 tier system', () => {
   test('v0.38 D7: tier.subagent accepts non-Anthropic models that support tools (with cost warn)', async () => {
     // Pre-v0.38 the resolver hard-fell-back to TIER_DEFAULTS.subagent for any
     // non-Anthropic model. v0.38 (D6/D7) replaces that with a capability check:
-    // OpenAI/Gemini/etc. support tools → resolved unchanged + warn about
-    // missing prompt caching (cost regression on long loops, not a refusal).
+    // a provider with tools but no prompt caching → resolved unchanged + warn
+    // about the cost regression on long loops (not a refusal).
+    stub.set('models.default', 'google:gemini-1.5-pro');
+    const m = await resolveModel(stub as never, {
+      tier: 'subagent',
+      fallback: 'sonnet',
+    });
+    expect(m).toBe('google:gemini-1.5-pro');
+    expect(stderrCapture).toContain('caching');
+  });
+
+  test('v0.38 D7: a provider that caches automatically is accepted WITHOUT the cost warn', async () => {
+    // The warn advises moving to an Anthropic model "for lower cost on long
+    // loops". On providers that already cache prompt prefixes server-side that
+    // advice is backwards, so the capability check must not fire it.
     stub.set('models.default', 'openai:gpt-5.2');
     const m = await resolveModel(stub as never, {
       tier: 'subagent',
       fallback: 'sonnet',
     });
     expect(m).toBe('openai:gpt-5.2');
-    expect(stderrCapture).toContain('caching');
+    expect(stderrCapture).not.toContain('caching');
   });
 
   test('v0.38 D7: tier.subagent rejects unknown providers (falls back to default)', async () => {

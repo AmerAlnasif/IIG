@@ -341,6 +341,10 @@ async function runPipelineWithBody(
     return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [] };
   }
 
+  const filter = ctx.notabilityFilter ?? 'all';
+  const notabilityAdmission = filter === 'high-only'
+    ? { allowed: ['high'] as const, invalid: 'drop' as const }
+    : undefined;
   const facts = await extractFactsFromTurn({
     turnText: input.turnText,
     sessionId: ctx.sessionId,
@@ -350,9 +354,9 @@ async function runPipelineWithBody(
     engine: ctx.engine,
     abortSignal,
     model: ctx.model,
+    notabilityAdmission,
   });
 
-  const filter = ctx.notabilityFilter ?? 'all';
   // [ENG-8] Explicit ctx.visibility wins; unset resolves the operator-set
   // facts.default_visibility (fail-closed to 'private').
   const { resolveDefaultVisibility } = await import('./visibility.ts');

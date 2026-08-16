@@ -1017,11 +1017,13 @@ export interface BrainEngine {
    * a federated grant (`sourceIds[]`) wins over scalar `sourceId`; with
    * neither set, the lookup falls back to the `'default'` source (the
    * local-untyped-call default that importCodeFile's incremental embedding
-   * reuse relies on). Embedding vectors are never selected — rowToChunk
-   * discards them at these call sites, so pulling them was pure egress
-   * (#2544).
+   * reuse relies on). Embedding vectors are omitted by default — most callers
+   * discard them, so pulling them was pure egress (#2544). `includeEmbedding`
+   * opts back in for the callers that consume them (importCodeFile's reuse
+   * cache). Prefer it over `getChunksWithEmbeddings`, which applies neither the
+   * federated scope precedence nor the RLS scope binding.
    */
-  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean }): Promise<Chunk[]>;
   /**
    * Count chunks across the brain where embedding IS NULL.
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain

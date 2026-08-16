@@ -4983,7 +4983,8 @@ export class PGLiteEngine implements BrainEngine {
     since: Date,
     opts?: FactListOpts & { entitySlug?: string },
   ): Promise<FactRow[]> {
-    const where: string[] = [`created_at >= $since`];
+    const tsExpr = opts?.eventTime === true ? 'COALESCE(valid_from, created_at)' : 'created_at';
+    const where: string[] = [`${tsExpr} >= $since`];
     const params: Record<string, unknown> = { since };
     if (opts?.entitySlug) {
       where.push(`entity_slug = $entitySlug`);
@@ -4993,7 +4994,7 @@ export class PGLiteEngine implements BrainEngine {
       ...opts,
       whereClauses: where,
       whereParams: params,
-      order: 'created_at DESC, id DESC',
+      order: `${tsExpr} DESC, id DESC`,
     });
   }
 

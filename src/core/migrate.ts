@@ -5853,6 +5853,25 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE minion_jobs ADD CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000));
     `,
   },
+  {
+    version: 131,
+    name: 'facts_event_time_index',
+    // Event-time recall (FactListOpts.eventTime) filters and orders on
+    // COALESCE(valid_from, created_at), which the created_at index at v40
+    // (idx_facts_since) cannot serve. Without a matching expression index
+    // the common `recall` shape — epoch cutoff, no entity, ORDER BY … LIMIT n
+    // — degrades from an index scan that stops at n rows into a full scan of
+    // the source plus a sort. Mirrors idx_facts_since's shape (same leading
+    // column, same partial predicate) so the two paths cost the same.
+    // (Authored as v129, renumbered to v130 when #4152 took 129, and to v131
+    // when #4145's minion_jobs_lock_duration_ms took 130.)
+    idempotent: true,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_facts_since_event_time
+        ON facts (source_id, (COALESCE(valid_from, created_at)) DESC)
+        WHERE expired_at IS NULL;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

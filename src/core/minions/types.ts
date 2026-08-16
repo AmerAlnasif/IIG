@@ -71,6 +71,8 @@ export interface MinionJob {
   max_children: number | null;
   timeout_ms: number | null;
   timeout_at: Date | null;
+  /** Per-job lock lease (ms, #4145). NULL = worker-global lockDuration default. */
+  lock_duration_ms: number | null;
   remove_on_complete: boolean;
   remove_on_fail: boolean;
   idempotency_key: string | null;
@@ -128,6 +130,8 @@ export interface MinionJobInput {
   max_children?: number;
   /** Wall-clock per-job deadline in ms. Set on claim → timeout_at. Terminal on expire (no retry). */
   timeout_ms?: number;
+  /** Per-job lock lease in ms (#4145). Clamped to [5s,1h]; NULL/undefined → handler map, then worker default. INSERT-only: an idempotency-key re-submit never mutates the first submitter's lease. */
+  lock_duration_ms?: number;
   /** DELETE row on successful completion (after token rollup + child_done insert). */
   remove_on_complete?: boolean;
   /** DELETE row on terminal failure (after parent failure hook). */
@@ -218,6 +222,16 @@ export interface MinionWorkerOpts {
    *  hung probe would wedge the recursive setTimeout chain forever and
    *  silently disable the health monitor. Default: 10000 (10 seconds). */
   dbProbeTimeoutMs?: number;
+  /** issue #5: 'process' runs each claimed job in a SIGKILL-able child
+   *  process (blast radius = 1 job). Default 'inline' (today's behavior).
+   *  Requires childCliInvocation; the CLI layer resolves + validates it. */
+  jobIsolation?: 'inline' | 'process';
+  /** How to invoke the gbrain CLI for job children (resolved fail-fast at
+   *  worker startup by the CLI layer; structurally ChildCliInvocation from
+   *  job-isolation.ts — kept inline here to avoid an import cycle). */
+  childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
+  /** tini path for wrapping job children ('' = absent, direct spawn). */
+  childTiniPath?: string;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -372,6 +386,20 @@ export type TranscriptEntry =
   | { type: 'llm_turn'; model: string; tokens_in: number; tokens_out: number; ts: string }
   | { type: 'error'; message: string; stack?: string; ts: string };
 
+// --- Abort-reason literals (single source of truth) ---
+//
+// Per-job abort sites construct `new Error(REASON)`; classification sites
+// (worker.ts INFRASTRUCTURE_ABORT_REASONS, child-job-runner.ts
+// PER_JOB_ABORT_REASONS) match on the message. Deriving both sets from these
+// constants keeps a rename at an abort site from silently flipping child
+// classification (maintainability review).
+
+/** Infrastructure faults: released, no attempt burned; stall sweeper requeues. */
+export const ABORT_REASON_LOCK_RENEWAL_FAILED = 'lock-renewal-failed';
+export const ABORT_REASON_LOCK_LOST = 'lock-lost';
+/** Job-targeted aborts: keep their existing attempt semantics. */
+export const ABORT_REASON_TIMEOUT = 'timeout';
+
 // --- Errors ---
 
 /** Throw this from a handler to skip all retry logic and go straight to 'dead'. */
@@ -411,6 +439,7 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     depth: (row.depth as number) ?? 0,
     max_children: (row.max_children as number) ?? null,
     timeout_ms: (row.timeout_ms as number) ?? null,
+    lock_duration_ms: (row.lock_duration_ms as number) ?? null,
     timeout_at: row.timeout_at ? new Date(row.timeout_at as string) : null,
     remove_on_complete: row.remove_on_complete === true,
     remove_on_fail: row.remove_on_fail === true,

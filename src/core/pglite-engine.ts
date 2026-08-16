@@ -94,6 +94,7 @@ import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './o
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
+import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -4970,10 +4971,16 @@ export class PGLiteEngine implements BrainEngine {
     entitySlug: string,
     opts?: FactListOpts,
   ): Promise<FactRow[]> {
+    const where: string[] = [`entity_slug = $entitySlug`];
+    const whereParams: Record<string, unknown> = { entitySlug };
+    if (opts?.excludeAuditRows === true) {
+      where.push(`NOT (source = ANY($auditSources))`);
+      whereParams.auditSources = [...AUDIT_ROW_SOURCES];
+    }
     return this._listFacts(source_id, {
       ...opts,
-      whereClauses: [`entity_slug = $entitySlug`],
-      whereParams: { entitySlug },
+      whereClauses: where,
+      whereParams,
       order: 'valid_from DESC, id DESC',
     });
   }
@@ -4989,6 +4996,10 @@ export class PGLiteEngine implements BrainEngine {
       where.push(`entity_slug = $entitySlug`);
       params.entitySlug = opts.entitySlug;
     }
+    if (opts?.excludeAuditRows === true) {
+      where.push(`NOT (source = ANY($auditSources))`);
+      params.auditSources = [...AUDIT_ROW_SOURCES];
+    }
     return this._listFacts(source_id, {
       ...opts,
       whereClauses: where,
@@ -5002,10 +5013,16 @@ export class PGLiteEngine implements BrainEngine {
     sessionId: string,
     opts?: FactListOpts,
   ): Promise<FactRow[]> {
+    const where: string[] = [`source_session = $sessionId`];
+    const whereParams: Record<string, unknown> = { sessionId };
+    if (opts?.excludeAuditRows === true) {
+      where.push(`NOT (source = ANY($auditSources))`);
+      whereParams.auditSources = [...AUDIT_ROW_SOURCES];
+    }
     return this._listFacts(source_id, {
       ...opts,
-      whereClauses: [`source_session = $sessionId`],
-      whereParams: { sessionId },
+      whereClauses: where,
+      whereParams,
       order: 'created_at DESC, id DESC',
     });
   }

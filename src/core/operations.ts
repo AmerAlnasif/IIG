@@ -19,6 +19,7 @@ import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '
 import type { HybridSearchMeta } from './types.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
+import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import type { WriterLintPayload } from './output/post-write.ts';
 import { stripFactsFence } from './facts-fence.ts';
@@ -4974,12 +4975,14 @@ const recall: Operation = {
         activeOnly: !includeExpired,
         limit,
         visibility,
+        excludeAuditRows: true,
       });
     } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
       rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, {
         activeOnly: !includeExpired,
         limit,
         visibility,
+        excludeAuditRows: true,
       });
     } else if (p.since !== undefined) {
       const since = parseSinceParam(p.since);
@@ -4988,6 +4991,7 @@ const recall: Operation = {
           activeOnly: !includeExpired,
           limit,
           visibility,
+          excludeAuditRows: true,
         });
       }
     } else {
@@ -4996,8 +5000,17 @@ const recall: Operation = {
         activeOnly: !includeExpired,
         limit,
         visibility,
+        excludeAuditRows: true,
       });
     }
+
+    // extract-conversation-facts writes durable audit checkpoint rows
+    // (source = TERMINAL_AUDIT_SOURCE / NON_EXTRACTABLE_AUDIT_SOURCE) into
+    // the facts table. They are checkpoints, not user facts. Every arm
+    // above already passes excludeAuditRows: true (SQL-level, both
+    // engines, keyed on `source` not `fact` text) — this client-side
+    // filter is belt-and-braces defense in depth, not the primary guard.
+    rows = rows.filter((r) => !(AUDIT_ROW_SOURCES as readonly string[]).includes(r.source));
 
     if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 

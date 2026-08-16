@@ -93,6 +93,13 @@ import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
 import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../core/extract/rollup-writer.ts';
+import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../core/facts/audit-sources.ts';
+
+// Re-exported for existing importers (test/extract-conversation-facts.test.ts,
+// test/doctor-conversation-facts-backlog.test.ts, src/eval/brainbench/metrics/write-back.ts).
+// The values themselves now live in ../core/facts/audit-sources.ts — see that
+// leaf module's docstring for why (engine-live static-import requirement).
+export { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE };
 
 // ---------------------------------------------------------------------------
 // Tunables (exported for tests).
@@ -201,21 +208,13 @@ export const CHECKPOINT_OP = 'extract-conversation-facts';
  */
 export const PER_SEGMENT_SOURCE_PREFIX = 'cli:extract-conversation-facts';
 
-/**
- * Source string written on the page-level terminal audit row (Eng-v2 C7).
- * Doctor's backlog query matches THIS source + source_session, not
- * the per-segment source. Partial extraction = no terminal row = page
- * stays in backlog.
- */
-export const TERMINAL_AUDIT_SOURCE = 'cli:extract-conversation-facts:terminal:v2';
-
-/**
- * Durable outcome for a successfully scanned page that contains no eligible
- * multi-message segment. Kept distinct from successful extraction so operator
- * surfaces can report the truth without rescanning the page forever.
- */
-export const NON_EXTRACTABLE_AUDIT_SOURCE =
-  'cli:extract-conversation-facts:non-extractable:v2';
+// TERMINAL_AUDIT_SOURCE / NON_EXTRACTABLE_AUDIT_SOURCE: defined in
+// ../core/facts/audit-sources.ts, imported + re-exported above. (Doctor's
+// backlog query matches TERMINAL_AUDIT_SOURCE + source_session, not the
+// per-segment source; partial extraction = no terminal row = page stays in
+// backlog. NON_EXTRACTABLE_AUDIT_SOURCE is kept distinct from successful
+// extraction so operator surfaces can report the truth without rescanning
+// the page forever.)
 
 // ---------------------------------------------------------------------------
 // Public types.

@@ -96,6 +96,7 @@ import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './o
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
+import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -4843,6 +4844,7 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const excludeAuditRows = opts?.excludeAuditRows === true;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -4850,6 +4852,7 @@ export class PostgresEngine implements BrainEngine {
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -4868,6 +4871,7 @@ export class PostgresEngine implements BrainEngine {
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const entitySlug = opts?.entitySlug ?? null;
+    const excludeAuditRows = opts?.excludeAuditRows === true;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -4876,6 +4880,7 @@ export class PostgresEngine implements BrainEngine {
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -4893,6 +4898,7 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const excludeAuditRows = opts?.excludeAuditRows === true;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -4900,6 +4906,7 @@ export class PostgresEngine implements BrainEngine {
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;

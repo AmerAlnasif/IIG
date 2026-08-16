@@ -15,6 +15,9 @@
 
 import type { BrainEngine } from './engine.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
+import { rmSync, lstatSync } from 'node:fs';
+import { isPathContained } from './path-confine.ts';
+import { gbrainPath } from './config.ts';
 
 // ── Types ───────────────────────────────────────────────────
 
@@ -286,13 +289,35 @@ export async function listArchivedSources(
 export async function purgeExpiredSources(
   engine: BrainEngine,
 ): Promise<string[]> {
-  const rows = await engine.executeRaw<{ id: string }>(
-    `DELETE FROM sources
-     WHERE archived = true
-       AND archive_expires_at IS NOT NULL
-       AND archive_expires_at <= now()
-     RETURNING id`,
+  const rows = await engine.executeRaw<{ id: string; config: unknown; local_path: string | null }>(
+    `SELECT id, config, local_path FROM sources
+    WHERE archived = true
+      AND archive_expires_at IS NOT NULL
+      AND archive_expires_at <= now()`,
   );
+  if (rows.length === 0) return [];
+  await engine.executeRaw(
+    `DELETE FROM sources
+    WHERE archived = true
+      AND archive_expires_at IS NOT NULL
+      AND archive_expires_at <= now()`,
+  );
+  // v0.46: github-kind mirrors are gbrain-owned only when created at the
+  // default clone location (gh_managed marker). Purging removes that
+  // managed mirror with the same containment and symlink checks as
+  // removeSource: an altered or stale local_path must never be recursively
+  // deleted outside the current clone root (codex MED, round 4).
+  const cloneRoot = gbrainPath('clones');
+  for (const row of rows) {
+    const cfg = (typeof row.config === 'string' ? JSON.parse(row.config) : (row.config ?? {})) as Record<string, unknown>;
+    if (cfg.kind !== 'github' || cfg.gh_managed !== true || !row.local_path) continue;
+    try {
+      if (!isPathContained(row.local_path, cloneRoot)) continue;
+      const lst = lstatSync(row.local_path);
+      if (lst.isSymbolicLink()) continue;
+      rmSync(row.local_path, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  }
   return rows.map((r) => r.id);
 }
 

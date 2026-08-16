@@ -1061,6 +1061,13 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.brainstorm.judge',
   'models.eval.longmemeval',
   'facts.extraction_model',
+  // Brain-wide kill switch for fact extraction, read by
+  // src/core/facts/extract.ts:isFactsExtractionEnabled and honored by
+  // sweep.ts, operations.ts and transcripts/ingest-facts.ts. That function's
+  // own docstring tells operators to flip it with
+  // `gbrain config set facts.extraction_enabled false` — which was rejected
+  // as an unknown key until this registration.
+  'facts.extraction_enabled',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
@@ -1211,6 +1218,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
+  'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
 ];
 
 /**

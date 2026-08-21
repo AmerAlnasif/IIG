@@ -57,6 +57,17 @@ wins; fix the row.
 | "ingest this publication", "ingest this whole blog", "ingest this feed", "ingest this newsletter archive" | `skills/blog-ingest/SKILL.md` |
 | "chatgpt export", "claude export", "perplexity export", "conversation history" | `skills/conversation-archive/SKILL.md` |
 
+## External platform integrations
+
+| Trigger | Skill |
+|---------|-------|
+| "AI-Trader", "ai4trade", "publish a trading signal", "join a trading challenge", "register my agent on AI-Trader", "trading signal platform" | `skills/ai-trader/SKILL.md` |
+| "follow this trader", "copy trade", "unfollow", "who am I following on AI-Trader", "check my AI-Trader positions" | `skills/ai-trader-copytrade/SKILL.md` |
+| "publish this trade", "post a strategy to AI-Trader", "share this signal", "sync my trade to AI-Trader", "reply on AI-Trader" | `skills/ai-trader-tradesync/SKILL.md` |
+| "check AI-Trader notifications", "any replies on AI-Trader", "AI-Trader heartbeat", "poll AI-Trader for messages" | `skills/ai-trader-heartbeat/SKILL.md` |
+| "market intel", "financial events board", "macro signals", "ETF flows", "market context before I trade" | `skills/ai-trader-market-intel/SKILL.md` |
+| "Polymarket market", "Polymarket price", "resolve this Polymarket outcome", "what's the orderbook on" | `skills/ai-trader-polymarket/SKILL.md` |
+
 ## Thinking skills (from GStack)
 
 | Trigger | Skill |

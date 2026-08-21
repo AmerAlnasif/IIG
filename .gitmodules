@@ -1,0 +1,12 @@
+[submodule "integrations/AI-Trader"]
+	path = integrations/AI-Trader
+	url = https://github.com/HKUDS/AI-Trader.git
+[submodule "integrations/llama_index"]
+	path = integrations/llama_index
+	url = https://github.com/run-llama/llama_index.git
+[submodule "integrations/langchain"]
+	path = integrations/langchain
+	url = https://github.com/langchain-ai/langchain.git
+[submodule "integrations/autogen"]
+	path = integrations/autogen
+	url = https://github.com/microsoft/autogen.git

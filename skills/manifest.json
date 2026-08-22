@@ -378,6 +378,16 @@
 "name": "ai-trader-polymarket",
 "path": "ai-trader-polymarket/SKILL.md",
 "description": "Resolve Polymarket public markets and orderbook prices directly from Polymarket's own APIs (never via AI-Trader), then hand off a resolved outcome to ai-trader-tradesync."
+},
+{
+"name": "llamaindex-parse",
+"path": "llamaindex-parse/SKILL.md",
+"description": "Parse documents (130+ formats: PDF, DOCX, PPTX, images, spreadsheets) into clean Markdown/text via LlamaParse's HTTP API -- no Python runtime required. Utility skill for gbrain's ingestion skills when they need high-fidelity OCR/parsing."
+},
+{
+"name": "langchain-hub",
+"path": "langchain-hub/SKILL.md",
+"description": "Growing hub skill for LangChain-ecosystem HTTP APIs callable with no Python runtime: LangSmith tracing/eval today, LangGraph Platform deployed-agent runs today, more capabilities appended over time. See the skill file's 'Extending this file' section."
 }
 ],
 "dependencies": {

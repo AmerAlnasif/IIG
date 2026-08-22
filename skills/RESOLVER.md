@@ -67,6 +67,10 @@ wins; fix the row.
 | "check AI-Trader notifications", "any replies on AI-Trader", "AI-Trader heartbeat", "poll AI-Trader for messages" | `skills/ai-trader-heartbeat/SKILL.md` |
 | "market intel", "financial events board", "macro signals", "ETF flows", "market context before I trade" | `skills/ai-trader-market-intel/SKILL.md` |
 | "Polymarket market", "Polymarket price", "resolve this Polymarket outcome", "what's the orderbook on" | `skills/ai-trader-polymarket/SKILL.md` |
+| "parse this PDF with LlamaParse", "OCR this document", "llama parse", "high-fidelity document parsing", "this PDF's text extraction is garbled" | `skills/llamaindex-parse/SKILL.md` |
+| "log this run to LangSmith", "trace this with LangSmith", "LangSmith eval", "langchain tracing" | `skills/langchain-hub/SKILL.md` (Capability A) |
+| "run my LangGraph deployment", "call my langgraph agent", "LangGraph Platform", "invoke my deployed graph" | `skills/langchain-hub/SKILL.md` (Capability B) |
+| "does gbrain support autogen", "add autogen", "autogen integration", "multi-agent orchestration like autogen" | `recipes/autogen.md` (assessment: no functional integration exists -- see file for why) |
 
 ## Thinking skills (from GStack)
 

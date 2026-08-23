@@ -8,6 +8,9 @@ IIG is the umbrella project going forward: a Postgres-native knowledge engine at
 | --- | --- |
 | `src/core/`, `src/commands/`, `src/mcp/` | The knowledge engine: ingestion, hybrid search, knowledge graph, job queue, MCP server. |
 | `src/integrations/kalshi/` | Kalshi Trade API v2 client, 76 endpoints. Setup: `recipes/kalshi-api.md`. |
+| `src/integrations/agents/`, `integrations/mcp-sidecars/` | MCP sidecar bridge to LlamaIndex, LangChain, and AutoGen (AI-Trader is an honest scaffold, not yet real). Docs: `docs/integrations/agent-frameworks.md`. |
+| `src/integrations/compliance/` | Hash-chained compliance record log + human-review gate. Docs: `docs/compliance/recordkeeping-and-review.md`. |
+| `src/workflows/` | First-party workflows built on the engine and integrations, not external integrations themselves. `src/workflows/wealth/` holds the first one. |
 | `skills/` | 43 bundled skills for capture, enrichment, querying, and brain operations. |
 | `admin/` | Local web dashboard, built separately and embedded into the CLI binary. |
 | `docs/` | Architecture, install paths, and integration guides. |
@@ -51,3 +54,4 @@ Run `bun run test` for the fast loop and `bun run verify` for the pre-push gate.
 ## License and credit
 
 MIT. The core engine began as the open-source GBrain project. See `LICENSE` and `CHANGELOG.md` for full history and contributor credit.
+

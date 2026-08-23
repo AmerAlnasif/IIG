@@ -5,7 +5,42 @@
  *   KALSHI-ACCESS-KEY        the API Key ID
  *   KALSHI-ACCESS-TIMESTAMP  current time in Unix milliseconds
  *   KALSHI-ACCESS-SIGNATURE  base64(RSA-PSS-SHA256(timestamp + METHOD + path))
- *
+import { createSign, type KeyLike } from "node:crypto";
+
+export interface KalshiSignedHeaders {
+"KALSHI-ACCESS-KEY": string;
+"KALSHI-ACCESS-TIMESTAMP": string;
+"KALSHI-ACCESS-SIGNATURE": string;
+}
+
+export function signKalshiRequest(
+apiKeyId: string,
+privateKey: KeyLike,
+method: string,
+path: string,
+): KalshiSignedHeaders {
+const timestampMs = Date.now().toString();
+const message = `${timestampMs}${method.toUpperCase()}${path}`;
+
+const signature = createSign("RSA-SHA256")
+.update(message)
+.end()
+.sign(
+{
+key: privateKey,
+padding: 6,
+saltLength: 32,
+},
+"base64",
+);
+
+return {
+"KALSHI-ACCESS-KEY": apiKeyId,
+"KALSHI-ACCESS-TIMESTAMP": timestampMs,
+"KALSHI-ACCESS-SIGNATURE": signature,
+};
+}
+*
  * The signed message is `${timestampMs}${HTTP_METHOD}${path}` where `path`
  * is the request path WITHOUT the query string (e.g. `/trade-api/v2/portfolio/orders`,
  * not `/trade-api/v2/portfolio/orders?limit=5`).

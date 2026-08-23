@@ -1,0 +1,6 @@
+mcp>=1.2.0
+llama-index>=0.11.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+autogen-agentchat>=0.4.0
+autogen-ext[openai]>=0.4.0

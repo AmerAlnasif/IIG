@@ -1,4 +1,3 @@
-test line one
 /**
  * Kalshi Trade API v2 client.
   *

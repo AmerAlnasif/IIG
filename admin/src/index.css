@@ -68,6 +68,27 @@ body {
   color: var(--text-primary);
 }
 
+/* Mobile nav toggle + overlay — hidden entirely on desktop, only
+   switched on inside the 768px breakpoint below. */
+.mobile-nav-toggle {
+  display: none;
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 101;
+  background: var(--bg-secondary);
+  border: 1px solid #333;
+  color: var(--text-primary);
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  font-size: 16px;
+  cursor: pointer;
+}
+.sidebar-overlay { display: none; }
+
 .main { flex: 1; padding: 24px 32px; overflow-y: auto; }
 
 .page-title {
@@ -334,16 +355,46 @@ label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
 }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 
-/* Login page */
+/* Login page — v0.42+ UX pass: this is the first screen anyone sees,
+   so it reads as a welcome/landing state (page title + tagline, a
+   plain surface card for instructions) rather than an access-denied
+   warning. Same auth flow, calmer presentation. */
 .login-page {
   display: flex;
   align-items: center;
   justify-content: center;
   min-height: 100vh;
   background: var(--bg-primary);
+  padding: 24px;
 }
-.login-box { text-align: left; width: 340px; }
-.login-logo { font-size: 32px; font-weight: 600; margin-bottom: 32px; }
+.login-box { text-align: left; width: 340px; max-width: 100%; }
+.login-logo { font-size: 32px; font-weight: 600; margin-bottom: 4px; }
+.login-tagline { color: var(--text-secondary); font-size: 13px; margin-bottom: 24px; }
+.login-welcome {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+.login-welcome-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+.login-welcome-body { color: var(--text-secondary); font-size: 13px; }
+.login-welcome-prompt {
+  background: rgba(0,0,0,0.3);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: #88aaff;
+  word-break: break-all;
+}
 .login-hint { color: var(--text-muted); font-size: 12px; margin-top: 12px; }
 .login-error { color: var(--error); font-size: 13px; margin-top: 8px; }
 
@@ -352,8 +403,28 @@ label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
 
 /* Responsive */
 @media (max-width: 768px) {
-  .sidebar { display: none; }
-  .main { padding: 16px; }
+  .mobile-nav-toggle { display: flex; }
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    max-width: 80vw;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    z-index: 100;
+  }
+  .sidebar.sidebar-open { transform: translateX(0); }
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 99;
+  }
+  .main { padding: 16px; padding-top: 64px; }
   .metrics { flex-wrap: wrap; }
   .drawer { width: 100%; }
 }
+

@@ -17,6 +17,13 @@ function getPage(): Page {
 
 export function App() {
   const [page, setPage] = useState<Page>(getPage);
+  // v0.42+ UX pass: the sidebar was the only nav surface and it was
+  // hidden outright below 768px with nothing to replace it, so a
+  // phone-width visitor had no way to switch pages once loaded. This
+  // turns it into a toggleable off-canvas drawer on small screens
+  // (desktop layout is unaffected — the toggle button only renders
+  // via CSS below the same 768px breakpoint).
+  const [navOpen, setNavOpen] = useState(false);
 
   useEffect(() => {
     const onHash = () => setPage(getPage());
@@ -27,6 +34,7 @@ export function App() {
   const navigate = (p: Page) => {
     window.location.hash = p;
     setPage(p);
+    setNavOpen(false);
   };
 
   if (page === 'login') {
@@ -47,19 +55,28 @@ export function App() {
 
   return (
     <div className="app">
-      <nav className="sidebar">
+      <button
+        className="mobile-nav-toggle"
+        onClick={() => setNavOpen(o => !o)}
+        aria-label={navOpen ? 'Close navigation' : 'Open navigation'}
+        aria-expanded={navOpen}
+      >
+        {navOpen ? '✕' : '☰'}
+      </button>
+      {navOpen && <div className="sidebar-overlay" onClick={() => setNavOpen(false)} />}
+      <nav className={`sidebar ${navOpen ? 'sidebar-open' : ''}`}>
         <div className="sidebar-logo">GBrain</div>
         <div className="sidebar-nav">
           <a className={`nav-item ${page === 'dashboard' ? 'active' : ''}`}
-             onClick={() => navigate('dashboard')}>Dashboard</a>
+            onClick={() => navigate('dashboard')}>Dashboard</a>
           <a className={`nav-item ${page === 'agents' ? 'active' : ''}`}
-             onClick={() => navigate('agents')}>Agents</a>
+            onClick={() => navigate('agents')}>Agents</a>
           <a className={`nav-item ${page === 'log' ? 'active' : ''}`}
-             onClick={() => navigate('log')}>Request Log</a>
+            onClick={() => navigate('log')}>Request Log</a>
           <a className={`nav-item ${page === 'calibration' ? 'active' : ''}`}
-             onClick={() => navigate('calibration')}>Calibration</a>
+            onClick={() => navigate('calibration')}>Calibration</a>
           <a className={`nav-item ${page === 'jobs' ? 'active' : ''}`}
-             onClick={() => navigate('jobs')}>Jobs Watch</a>
+            onClick={() => navigate('jobs')}>Jobs Watch</a>
         </div>
         <div style={{ marginTop: 'auto', padding: '16px 12px', borderTop: '1px solid var(--border)' }}>
           <button
@@ -90,3 +107,4 @@ export function App() {
     </div>
   );
 }
+
